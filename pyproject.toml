@@ -24,7 +24,13 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
 ]
-dependencies = []
+dependencies = [
+    "numpy",
+    "xarray[io,accell]",
+    "zarr",
+    "yaml",
+    "argparse",
+]
 description = "Python utility to convert output of the Dutch Atmospheric LES to zarr format"
 keywords = [
     "atmospheric physics",
@@ -49,6 +55,7 @@ dev = [
     "sphinx-autoapi",
     "tox",
     "myst_parser",
+    "pandas",
 ]
 publishing = [
     "build",
