@@ -4,10 +4,10 @@ cff-version: "1.2.0"
 title: "dales2zarr"
 authors:
   -
-    family-names: Oord
+    family-names: van den Oord
     given-names: Gijs
-    orcid: "https://orcid.org/0000-0000-0000-0000"
-date-released: 20??-MM-DD
+    orcid: "https://orcid.org/0000-0001-8367-1333"
+date-released: 2024-05-24
 doi: <insert your DOI here>
 version: "0.1.0"
 repository-code: "https://github.com/NLeSC/dales2zarr"
