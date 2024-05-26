@@ -2,6 +2,7 @@ import argparse
 import xarray as xr
 import yaml
 import zarr
+import logging
 from dales2zarr.zarr_cast import multi_cast_to_int8
 
 
@@ -35,11 +36,12 @@ def main(arg_list=None):
     Returns:
         None
     """
+    logging.basicConfig(level=logging.INFO)
     # Parse command-line arguments
     args = parse_args(arg_list)
 
     # Read the input dataset from file
-    input_ds = xr.open_dataset(args.input)
+    input_ds = xr.open_dataset(args.input, chunks='auto')
 
     if args.config is None:
         # Default input configurationz

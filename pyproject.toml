@@ -68,6 +68,9 @@ Repository = "https://github.com/NLeSC/dales2zarr"
 Issues = "https://github.com/NLeSC/dales2zarr/issues"
 Changelog = "https://github.com/NLeSC/dales2zarr/CHANGELOG.md"
 
+[project.scripts]
+dales2zarr = "dales2zarr.convert_int8:main"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
