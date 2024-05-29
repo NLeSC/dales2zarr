@@ -201,7 +201,7 @@ def cast_to_int8(input_ds, input_var, output_var=None, mode='linear', epsilon=1e
     Returns:
         xarray.Dataset: The input dataset with the variable casted to an 8-bit integer.
     """
-    if input_var not in input_ds:
+    if input_var not in input_ds.keys():
         log.warning(f'Variable {input_var} not found in the input dataset... skipping')
         return None
     var_name = input_var if output_var is None else output_var
