@@ -1,8 +1,8 @@
 import argparse
+import logging
 import xarray as xr
 import yaml
 import zarr
-import logging
 from dales2zarr.zarr_cast import multi_cast_to_int8
 
 

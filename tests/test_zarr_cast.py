@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import xarray as xr
+from dales2zarr.zarr_cast import cast_to_int8
 from dales2zarr.zarr_cast import cast_to_int8_2d
 from dales2zarr.zarr_cast import cast_to_int8_3d
 from dales2zarr.zarr_cast import multi_cast_to_int8
@@ -92,6 +93,27 @@ def test_cast_to_int8():
     # Check the output dataset
     expected_data = np.array([[0, 51, 102], [153, 204, 255]], dtype='uint8')
     assert np.array_equal(output_ds['temperature'].values, expected_data)
+
+
+def test_unavailable_variable():
+    """Test function for casting a variable to 8-bit integers.
+
+    This function creates a sample input dataset with temperature values and calls the `cast_to_int8_2d` function
+    to convert the temperature variable to 8-bit integers. It then checks if the output dataset matches the expected
+    data.
+
+    Returns:
+        None
+    """
+    # Create a sample input dataset
+    input_data = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    input_ds = xr.Dataset({'temperature': (['yt', 'xt'], input_data)})
+
+    # Call the function to convert the variable to 8-bit integers
+    output_ds = cast_to_int8(input_ds, 'rain')
+
+    # Check the output dataset
+    assert output_ds is None
 
 
 def test_cast_to_int8_2d_attrs():
