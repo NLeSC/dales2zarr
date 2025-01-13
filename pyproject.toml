@@ -27,7 +27,7 @@ classifiers = [
 dependencies = [
     "numpy",
     "xarray[io,accell]",
-    "zarr",
+    "zarr >= 2.18.0, < 3",
     "pyyaml",
     "argparse",
     "dask",

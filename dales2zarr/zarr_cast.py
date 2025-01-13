@@ -88,7 +88,7 @@ def cast_to_int8_3d(input_ds, var_name, mode='linear', epsilon=1e-10):
 
     # Compute the maximum values for each layer
     layer_maxes = input_data.max(['xt', 'yt']).values
-    log.info(f'layer maxes are {layer_maxes}')
+    log.info(f'layer maxes computed')
 
     # Compute the global maximum
     glob_max = np.max(layer_maxes)
@@ -105,7 +105,7 @@ def cast_to_int8_3d(input_ds, var_name, mode='linear', epsilon=1e-10):
     log.info(f'computed kbot and ktop: {kbot}, {ktop}')
 
     # Get the heights associated with the bottom and top layers
-    zbot, ztop = input_ds.zt[kbot], input_ds.zt[ktop]
+    zbot, ztop = input_ds.zt[kbot].values, input_ds.zt[ktop].values
     log.info(f'computed associated heights are: {zbot}, {ztop}')
 
     # Create a new array with the appropriate shape
