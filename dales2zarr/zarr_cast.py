@@ -217,20 +217,29 @@ def cast_to_int8(input_ds, input_var, output_var=None, mode='linear', epsilon=1e
         return cast_to_int8_2d(input_ds, var_name, mode, epsilon)
 
 
-def multi_cast_to_int8(input_ds, input_config):
-    """Casts multiple variables in the input dataset to 8-bit integers.
+def multi_cast_to_int8(input_data, input_config):
+    """Casts multiple variables in the input dataset(s) to 8-bit integers.
 
     Args:
-        input_ds (xarray.Dataset): The input dataset.
+        input_data (xarray.Dataset or dict): Either a single dataset containing all variables,
+            or a dict mapping variable names to their respective datasets.
         input_config (dict): A dictionary containing the configuration for casting the variables.
+            Each variable entry may include a 'file' key (used by callers for file loading) which
+            is ignored here.
 
     Returns:
-        xarray.Dataset: The input dataset with the variables casted to 8-bit integers.
+        xarray.Dataset: The merged dataset with the variables casted to 8-bit integers.
     """
     outputs, variables = [], []
     for input_var, var_options in input_config.items():
-        int8_var = cast_to_int8(input_ds, input_var, **var_options)
+        ds = input_data.get(input_var) if isinstance(input_data, dict) else input_data
+        if ds is None:
+            log.warning(f'No dataset found for variable {input_var}... skipping')
+            continue
+        cast_options = {k: v for k, v in var_options.items() if k != 'file'}
+        int8_var = cast_to_int8(ds, input_var, **cast_options)
         if int8_var is not None:
             outputs.append(int8_var)
-            variables.append(var_options.get('output_var', input_var))
+            variables.append(cast_options.get('output_var', input_var))
+    # NOTE: merge assumes all variables share compatible xt/yt/time grids; add join= handling for multi-grid support
     return xr.merge(outputs), variables

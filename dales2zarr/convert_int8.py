@@ -2,10 +2,17 @@
 
 import argparse
 import logging
+import os
 import xarray as xr
 import zarr
 import yaml
 from dales2zarr.zarr_cast import multi_cast_to_int8
+
+DEFAULT_INPUT_CONFIG = {
+    "ql":       {"mode": "log",    "file": "fielddump-ql.nc"},
+    "qr":       {"mode": "linear", "file": "fielddump-qr.nc"},
+    "thetavmix":{"mode": "linear", "file": "cape-thetavmix.nc"},
+}
 
 # Parse command-line arguments
 def parse_args(arg_list=None):
@@ -19,8 +26,8 @@ def parse_args(arg_list=None):
         argparse.Namespace: Parsed command-line arguments.
     """
     parser = argparse.ArgumentParser(description="Convert input dataset to 8-bit integers and write to zarr")
-    parser.add_argument("--input", metavar="FILE", type=str, required=True,
-                        help="Path to the input dataset file")
+    parser.add_argument("--input-dir", metavar="DIR", type=str, required=True, dest="input_dir",
+                        help="Path to the directory containing input NetCDF files")
     parser.add_argument("--output", metavar="FILE", type=str, required=False, default=None,
                         help="Path to the output zarr file")
     parser.add_argument("--config", metavar="FILE", type=str, required=False, default=None,
@@ -50,25 +57,31 @@ def main(arg_list=None):
     # Parse command-line arguments
     args = parse_args(arg_list)
 
-    # Read the input dataset from file
-    input_ds = xr.open_dataset(args.input, chunks='auto')
-
     if args.config is None:
-        # Default input configurationz
-        input_config = {"ql": {"mode": "log"}, "qr": {"mode": "linear"}}
+        input_config = DEFAULT_INPUT_CONFIG
     else:
         # Read the input configuration from yaml
         with open(args.config, "r") as f:
             input_config = yaml.safe_load(f)
 
-    # Keep only the first args.timestamps timestamps
-    if args.timestamps > 0:
-        input_ds = input_ds.isel(time=slice(0, args.timestamps))
+    # Open per-variable datasets from their respective input files
+    datasets = {}
+    for var_name, var_options in input_config.items():
+        default_file = DEFAULT_INPUT_CONFIG.get(var_name, {}).get("file", f"{var_name}.nc")
+        filename = var_options.get("file", default_file)
+        filepath = os.path.join(args.input_dir, filename)
+        try:
+            ds = xr.open_dataset(filepath, chunks='auto')
+            if args.timestamps > 0:
+                ds = ds.isel(time=slice(0, args.timestamps))
+            datasets[var_name] = ds
+        except FileNotFoundError:
+            logging.warning(f'Input file {filepath} not found for variable {var_name}... skipping')
 
-    # Call multi_cast_to_int8 on the input dataset
-    output_ds, output_variables = multi_cast_to_int8(input_ds, input_config)
+    # Call multi_cast_to_int8 on the per-variable datasets
+    output_ds, output_variables = multi_cast_to_int8(datasets, input_config)
 
-    outfile = args.output if args.output is not None else args.input.replace(".nc", "_int8.zarr")
+    outfile = args.output if args.output is not None else os.path.join(args.input_dir, "output_int8.zarr")
 
     # Write the result to zarr with Blosc compression
     compressor = zarr.Blosc(cname="lz4", clevel=6, shuffle=zarr.Blosc.BITSHUFFLE)
@@ -76,6 +89,7 @@ def main(arg_list=None):
     output_ds.to_zarr(outfile, mode=args.mode, encoding={var: var_encoding for var in output_variables})
 
     # Coarsen the dataset and write to zarr
+    # NOTE: coarsening assumes all output variables share the same horizontal grid resolution
     ds = output_ds
     for level in range(1, args.levels + 1):
         coarsen_op = ds.coarsen({dim: 2 for dim in ds.dims if dim != "time"}, boundary="trim")
