@@ -95,3 +95,25 @@ def test_main_with_custom_config():
 
         assert output_data["ql"].values.flat[:3].tolist() == [0, 84, 134]
         assert output_data["qr"].values.flat[:3].tolist() == [0, 36, 72]
+
+
+def test_main_coarsen_max():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        input_file = os.path.join(temp_dir, "input.nc")
+        output_file = os.path.join(temp_dir, "output.zarr")
+        lod1_file = os.path.join(temp_dir, "output-1.zarr")
+
+        # 4x4x4 so coarsening by 2 yields a 2x2x2 level
+        data = np.arange(64, dtype=float).reshape(4, 4, 4)
+        input_ds = xr.Dataset({"ql": (["zt", "yt", "xt"], data)})
+        input_ds.to_netcdf(input_file)
+
+        main(["--input", input_file, "--output", output_file, "--levels", "1", "--coarsen", "max"])
+
+        assert os.path.exists(lod1_file)
+        lod1 = xr.open_zarr(lod1_file)
+        assert "ql" in lod1
+        assert lod1["ql"].dtype == "uint8"
+        # max-pooling must produce values >= the mean-pooling equivalent
+        mean_ds = xr.open_zarr(output_file)
+        assert int(lod1["ql"].values.max()) >= int(mean_ds["ql"].values.max())

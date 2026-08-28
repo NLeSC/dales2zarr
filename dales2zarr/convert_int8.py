@@ -31,6 +31,9 @@ def parse_args(arg_list=None):
                         help="Number of timestamps to keep")
     parser.add_argument("--mode", metavar="w|a", type=str, required=False, default="a", choices=["w", "a"],
                         help="Write or append mode")
+    parser.add_argument("--coarsen", metavar="mean|max|median", type=str, required=False, default="mean",
+                        choices=["mean", "max", "median"],
+                        help="Coarsening method for LOD levels")
     return parser.parse_args(args=arg_list)
 
 
@@ -75,7 +78,8 @@ def main(arg_list=None):
     # Coarsen the dataset and write to zarr
     ds = output_ds
     for level in range(1, args.levels + 1):
-        ds = ds.coarsen({dim: 2 for dim in ds.dims if dim != "time"}, boundary="trim").mean()
+        coarsen_op = ds.coarsen({dim: 2 for dim in ds.dims if dim != "time"}, boundary="trim")
+        ds = getattr(coarsen_op, args.coarsen)()
         ds.to_zarr(outfile.replace(".zarr", f"-{level}.zarr"), mode="a", encoding={var: var_encoding for var in output_variables})
 
 
