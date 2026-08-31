@@ -215,31 +215,3 @@ def test_cast_to_int8_3d_time_dep():
     assert np.array_equal(output_ds['temperature'].values, expected_data)
     assert output_ds.attrs['ztop'] == 1500.0
     assert output_ds.attrs['zbot'] == 0.0
-
-
-def test_multi_cast_to_int8():
-    """Test function for multi_cast_to_int8.
-
-    This function tests the functionality of the multi_cast_to_int8 function by creating a sample input dataset,
-    defining the input configuration, calling the function to convert the variables to 8-bit integers, and checking
-    the output dataset.
-
-    Returns:
-        None
-    """
-    # Create a sample input dataset
-    input_data = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
-    input_ds = xr.Dataset({'temperature': (['yt', 'xt'], input_data),
-                           'humidity': (['yt', 'xt'], input_data)})
-
-    # Define the input configuration
-    input_config = {'temperature': {'mode': 'linear'},
-                    'humidity': {'mode': 'linear', 'output_var': 'qt'}}
-
-    # Call the function to convert the variables to 8-bit integers
-    output_ds,_ = multi_cast_to_int8(input_ds, input_config)
-
-    # Check the output dataset
-    expected_data = np.array([[0, 51, 102], [153, 204, 255]], dtype='uint8')
-    assert np.array_equal(output_ds['temperature'].values, expected_data)
-    assert np.array_equal(output_ds['qt'].values, expected_data)

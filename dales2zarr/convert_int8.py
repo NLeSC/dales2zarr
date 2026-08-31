@@ -6,12 +6,12 @@ import os
 import xarray as xr
 import zarr
 import yaml
-from dales2zarr.zarr_cast import multi_cast_to_int8
+from dales2zarr.zarr_cast import cast_to_int8
 
 DEFAULT_INPUT_CONFIG = {
-    "ql":       {"mode": "log",    "file": "fielddump-ql.nc"},
-    "qr":       {"mode": "linear", "file": "fielddump-qr.nc"},
-    "thetavmix":{"mode": "linear", "file": "cape-thetavmix.nc"},
+    "ql":       {"mode": "log",    "file": "fielddump-ql.nc", "variable": "ql"},
+    "qr":       {"mode": "linear", "file": "fielddump-qr.nc", "variable": "sv002"},
+    "thetavmix":{"mode": "linear", "file": "cape-thetavmix.nc", "variable": "thetavmix"},
 }
 
 # Parse command-line arguments
@@ -66,35 +66,52 @@ def main(arg_list=None):
 
     # Open per-variable datasets from their respective input files
     datasets = {}
-    for var_name, var_options in input_config.items():
-        default_file = DEFAULT_INPUT_CONFIG.get(var_name, {}).get("file", f"{var_name}.nc")
-        filename = var_options.get("file", default_file)
+    for target_variable, var_options in input_config.items():
+        prefix = "cape-" if target_variable == "thetavmix" else "fielddump-"
+        filename = var_options.get("file", f"{prefix}{target_variable}.nc")
         filepath = os.path.join(args.input_dir, filename)
         try:
             ds = xr.open_dataset(filepath, chunks='auto')
             if args.timestamps > 0:
                 ds = ds.isel(time=slice(0, args.timestamps))
-            datasets[var_name] = ds
+            datasets[target_variable] = ds
         except FileNotFoundError:
-            logging.warning(f'Input file {filepath} not found for variable {var_name}... skipping')
-
-    # Call multi_cast_to_int8 on the per-variable datasets
-    output_ds, output_variables = multi_cast_to_int8(datasets, input_config)
+            logging.warning(f'Input file {filepath} not found for variable {target_variable}... skipping')
 
     outfile = args.output if args.output is not None else os.path.join(args.input_dir, "output_int8.zarr")
 
     # Write the result to zarr with Blosc compression
     compressor = zarr.Blosc(cname="lz4", clevel=6, shuffle=zarr.Blosc.BITSHUFFLE)
     var_encoding = {"dtype": "uint8", "compressor": compressor}
-    output_ds.to_zarr(outfile, mode=args.mode, encoding={var: var_encoding for var in output_variables})
+
+    # Process and write each variable immediately to avoid accumulating all data in memory
+    output_variables = []
+    write_mode = args.mode
+    for target_variable, var_options in input_config.items():
+        ds = datasets.get(target_variable)
+        if ds is None:
+            continue
+        source_variable = var_options.get('variable', target_variable)
+        cast_option = var_options.get('mode', 'linear')
+        int8_var = cast_to_int8(ds, source_variable, target_variable, cast_option)
+        if int8_var is not None:
+            int8_var = int8_var.chunk({dim: "auto" for dim in int8_var.dims})
+            int8_var.to_zarr(outfile, mode=write_mode, encoding={target_variable: var_encoding})
+            output_variables.append(target_variable)
+            write_mode = "a"
 
     # Coarsen the dataset and write to zarr
     # NOTE: coarsening assumes all output variables share the same horizontal grid resolution
-    ds = output_ds
+    ds = xr.open_zarr(outfile) if args.levels > 0 else None
     for level in range(1, args.levels + 1):
         coarsen_op = ds.coarsen({dim: 2 for dim in ds.dims if dim != "time"}, boundary="trim")
         ds = getattr(coarsen_op, args.coarsen)()
-        ds.to_zarr(outfile.replace(".zarr", f"-{level}.zarr"), mode="a", encoding={var: var_encoding for var in output_variables})
+        level_outfile = outfile.replace(".zarr", f"-{level}.zarr")
+        for var in output_variables:
+            var_da = ds[var]
+            # use first-chunk sizes to guarantee the last chunk is never larger
+            uniform_chunks = {dim: var_da.chunks[i][0] for i, dim in enumerate(var_da.dims)}
+            var_da.chunk(uniform_chunks).to_zarr(level_outfile, mode="a", encoding={var: var_encoding})
 
 
 if __name__ == "__main__":

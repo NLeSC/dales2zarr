@@ -231,15 +231,16 @@ def multi_cast_to_int8(input_data, input_config):
         xarray.Dataset: The merged dataset with the variables casted to 8-bit integers.
     """
     outputs, variables = [], []
-    for input_var, var_options in input_config.items():
-        ds = input_data.get(input_var) if isinstance(input_data, dict) else input_data
+    for target_variable, var_options in input_config.items():
+        source_variable = var_options.get('variable', target_variable)
+        cast_option = var_options.get('mode', 'linear')
+        ds = input_data[target_variable]
         if ds is None:
-            log.warning(f'No dataset found for variable {input_var}... skipping')
+            log.warning(f'No variable found {source_variable} to produce {target_variable}... skipping')
             continue
-        cast_options = {k: v for k, v in var_options.items() if k != 'file'}
-        int8_var = cast_to_int8(ds, input_var, **cast_options)
+        int8_var = cast_to_int8(ds, source_variable, cast_option)
         if int8_var is not None:
             outputs.append(int8_var)
-            variables.append(cast_options.get('output_var', input_var))
+            variables.append(target_variable)
     # NOTE: merge assumes all variables share compatible xt/yt/time grids; add join= handling for multi-grid support
     return xr.merge(outputs), variables
