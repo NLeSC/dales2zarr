@@ -2,6 +2,7 @@
 
 import argparse
 import logging
+import math
 import os
 import xarray as xr
 import zarr
@@ -41,7 +42,23 @@ def parse_args(arg_list=None):
     parser.add_argument("--coarsen", metavar="mean|max|median", type=str, required=False, default="mean",
                         choices=["mean", "max", "median"],
                         help="Coarsening method for LOD levels")
+    parser.add_argument("--horizontal-chunks", metavar="INT", type=int, required=False, default=1,
+                        dest="horizontal_chunks",
+                        help="Number of chunks along each horizontal axis (time chunk is 1, z is unchunked)")
     return parser.parse_args(args=arg_list)
+
+
+def output_chunks(da, xy_chunks):
+    """Chunk sizes: 1 along time, `xy_chunks[dim]` along x/y, full size along all other (z) dimensions."""
+    chunks = {}
+    for dim in da.dims:
+        if dim == "time":
+            chunks[dim] = 1
+        elif dim in xy_chunks:
+            chunks[dim] = xy_chunks[dim]
+        else:
+            chunks[dim] = da.sizes[dim]
+    return chunks
 
 
 def main(arg_list=None):
@@ -86,6 +103,7 @@ def main(arg_list=None):
 
     # Process and write each variable immediately to avoid accumulating all data in memory
     output_variables = []
+    xy_chunks = {}  # horizontal chunk sizes, fixed by the first variable and shared by all variables and levels
     write_mode = args.mode
     for target_variable, var_options in input_config.items():
         ds = datasets.get(target_variable)
@@ -95,7 +113,10 @@ def main(arg_list=None):
         cast_option = var_options.get('mode', 'linear')
         int8_var = cast_to_int8(ds, source_variable, target_variable, cast_option)
         if int8_var is not None:
-            int8_var = int8_var.chunk({dim: "auto" for dim in int8_var.dims})
+            for dim in int8_var[target_variable].dims:
+                if dim.startswith(("x", "y")) and dim not in xy_chunks:
+                    xy_chunks[dim] = math.ceil(int8_var.sizes[dim] / args.horizontal_chunks)
+            int8_var = int8_var.chunk(output_chunks(int8_var[target_variable], xy_chunks))
             int8_var.to_zarr(outfile, mode=write_mode, encoding={target_variable: var_encoding})
             output_variables.append(target_variable)
             write_mode = "a"
@@ -109,9 +130,8 @@ def main(arg_list=None):
         level_outfile = outfile.replace(".zarr", f"-{level}.zarr")
         for var in output_variables:
             var_da = ds[var]
-            # use first-chunk sizes to guarantee the last chunk is never larger
-            uniform_chunks = {dim: var_da.chunks[i][0] for i, dim in enumerate(var_da.dims)}
-            var_da.chunk(uniform_chunks).to_zarr(level_outfile, mode="a", encoding={var: var_encoding})
+            var_da.chunk(output_chunks(var_da, xy_chunks)).to_zarr(
+                level_outfile, mode="a", encoding={var: var_encoding})
 
 
 if __name__ == "__main__":
