@@ -37,21 +37,16 @@ def normalize_data(data, data_min, data_max, mode, epsilon=1e-10):
         >>> normalize_data([1.0, 2.0, 3.0], 0.0, 10.0, 'linear')
         '[25, 50, 75]'
     """
+    data = np.asarray(data)
     if mode == 'linear':
-        # Calculate the scale factor and offset to map the data to the 8-bit integer range (0 to 255)
         scale_factor = 255.0 / (data_max - data_min)
-        offset = -data_min * scale_factor
+        normalized_data = (data - data_min) * scale_factor
         scale_factors = data_min, data_max
-
-        # Apply the scale factor and offset to normalize the data
-        normalized_data = scale_factor * data + offset
-
     elif mode == 'log':
-        # Apply the logarithmic transformation to highlight small values
-        log_data, log_min, log_max = np.log(data + epsilon), np.log(data_min + epsilon), np.log(data_max + epsilon)
-
-        # Scale the data to the 8-bit integer range (0 to 255)
-        normalized_data = 255.0 * (log_data - log_min) / (log_max - log_min)
+        log_min, log_max = np.log(data_min + epsilon), np.log(data_max + epsilon)
+        normalized_data = np.log(data + epsilon)
+        normalized_data -= log_min
+        normalized_data *= 255.0 / (log_max - log_min)
         scale_factors = log_min, log_max
     else:
         raise ValueError(f"Mode {mode} is not supported: please use either linear or log")
@@ -96,12 +91,8 @@ def cast_to_int8_3d(input_ds, var_name, mode='linear', epsilon=1e-10):
 
     # Normalize the layer maxes and get the indices of the bottom and top layers
     norms, _, _ = normalize_data(layer_maxes, glob_min, glob_max, mode, epsilon)
-    kbot, ktop, kmax = -1, -1, norms.shape[-1]
-    for k in range(kmax):
-        if np.max(norms[..., k]) != 0 and kbot < 0:
-            kbot = k
-        if np.max(norms[..., kmax - k - 1]) != 0 and ktop < 0:
-            ktop = kmax - k - 1
+    nonzero_layers = np.flatnonzero(norms.reshape(-1, norms.shape[-1]).max(axis=0))
+    kbot, ktop = (int(nonzero_layers[0]), int(nonzero_layers[-1])) if nonzero_layers.size else (-1, -1)
     log.info(f'computed kbot and ktop: {kbot}, {ktop}')
 
     # Get the heights associated with the bottom and top layers
