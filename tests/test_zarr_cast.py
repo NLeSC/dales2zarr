@@ -6,7 +6,6 @@ import xarray as xr
 from dales2zarr.zarr_cast import cast_to_int8
 from dales2zarr.zarr_cast import cast_to_int8_2d
 from dales2zarr.zarr_cast import cast_to_int8_3d
-from dales2zarr.zarr_cast import multi_cast_to_int8
 from dales2zarr.zarr_cast import normalize_data
 
 # These tests have been created with the help of github copilot

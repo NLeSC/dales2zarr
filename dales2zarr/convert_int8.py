@@ -7,13 +7,25 @@ import os
 import xarray as xr
 import zarr
 import yaml
+import numpy as np
 from dales2zarr.zarr_cast import cast_to_int8
 
 DEFAULT_INPUT_CONFIG = {
-    "ql":       {"mode": "log",    "file": "fielddump-ql.nc", "variable": "ql"},
-    "qr":       {"mode": "linear", "file": "fielddump-qr.nc", "variable": "sv002"},
-    "thetavmix":{"mode": "linear", "file": "cape-thetavmix.nc", "variable": "thetavmix"},
+    "variables": {
+        "ql":       {"mode": "log",    "file": "fielddump-ql.nc", "variable": "ql"},
+        "qr":       {"mode": "linear", "file": "fielddump-qr.nc", "variable": "sv002"},
+        "thetavmix":{"mode": "linear", "file": "cape-thetavmix.nc", "variable": "thetavmix"},
+    },
+    "dimensions": {"xt": "x", "yt": "y", "zt": "z"}
 }
+
+EUREC4A_INPUT_CONFIG = {
+    "variables": {
+        "ql":       {"mode": "log",    "files": "EUREC4A_highres.3d.*.nc", "variable": "qc", "concat_dim": "time", "missing_value": "-999."},
+    },
+    "dimensions": {"zu_3d": "z"}
+}
+
 
 # Parse command-line arguments
 def parse_args(arg_list=None):
@@ -27,8 +39,10 @@ def parse_args(arg_list=None):
         argparse.Namespace: Parsed command-line arguments.
     """
     parser = argparse.ArgumentParser(description="Convert input dataset to 8-bit integers and write to zarr")
-    parser.add_argument("--input-dir", metavar="DIR", type=str, required=True, dest="input_dir",
+    parser.add_argument("--input-dir", metavar="DIR", type=str, required=False, dest="input_dir",
                         help="Path to the directory containing input NetCDF files")
+    parser.add_argument("--input-url", metavar="URL", type=str, required=False, dest="input_url",
+                        help="URL to the input dataset")
     parser.add_argument("--output", metavar="FILE", type=str, required=False, default=None,
                         help="Path to the output zarr file")
     parser.add_argument("--config", metavar="FILE", type=str, required=False, default=None,
@@ -75,7 +89,7 @@ def main(arg_list=None):
     args = parse_args(arg_list)
 
     if args.config is None:
-        input_config = DEFAULT_INPUT_CONFIG
+        input_config = EUREC4A_INPUT_CONFIG
     else:
         # Read the input configuration from yaml
         with open(args.config, "r") as f:
@@ -83,19 +97,28 @@ def main(arg_list=None):
 
     # Open per-variable datasets from their respective input files
     datasets = {}
-    for target_variable, var_options in input_config.items():
-        prefix = "cape-" if target_variable == "thetavmix" else "fielddump-"
-        filename = var_options.get("file", f"{prefix}{target_variable}.nc")
-        filepath = os.path.join(args.input_dir, filename)
+    for target_variable, var_options in input_config.get("variables", {}).items():
+        filename = var_options.get("file", var_options.get("files", None))
+        if filename is None:
+            logging.warning(f'No input file specified for variable {target_variable}... skipping')
+            continue
+        if args.input_url:
+            filepath = args.input_url + '/' + filename
+        else:
+            filepath = os.path.join(args.input_dir, filename)
         try:
-            ds = xr.open_dataset(filepath, chunks='auto')
+            if var_options.get("files", None) is not None:
+                ds = xr.open_mfdataset(filepath, chunks='auto', engine=var_options.get("engine", None), concat_dim=var_options.get("concat_dim", None), combine='nested' )
+            else:
+                ds = xr.open_dataset(filepath, chunks='auto', engine=var_options.get("engine", None), missing_values=var_options.get("missing_value", None))
             if args.timestamps > 0:
                 ds = ds.isel(time=slice(0, args.timestamps))
-            datasets[target_variable] = ds
+            datasets[target_variable] = ds.rename_dims(input_config.get("dimensions", {}))
         except FileNotFoundError:
             logging.warning(f'Input file {filepath} not found for variable {target_variable}... skipping')
 
-    outfile = args.output if args.output is not None else os.path.join(args.input_dir, "output_int8.zarr")
+    default_output_dir = args.input_dir if args.input_dir is not None else "."
+    outfile = args.output if args.output is not None else os.path.join(default_output_dir, "output_int8.zarr")
 
     # Write the result to zarr with Blosc compression
     compressor = zarr.Blosc(cname="lz4", clevel=6, shuffle=zarr.Blosc.BITSHUFFLE)
@@ -105,13 +128,14 @@ def main(arg_list=None):
     output_variables = []
     xy_chunks = {}  # horizontal chunk sizes, fixed by the first variable and shared by all variables and levels
     write_mode = args.mode
-    for target_variable, var_options in input_config.items():
+    for target_variable, var_options in input_config.get("variables", {}).items():
         ds = datasets.get(target_variable)
         if ds is None:
             continue
         source_variable = var_options.get('variable', target_variable)
+        missing_value = var_options.get("missing_value", None)
         cast_option = var_options.get('mode', 'linear')
-        int8_var = cast_to_int8(ds, source_variable, target_variable, cast_option)
+        int8_var = cast_to_int8(ds, source_variable, target_variable, cast_option, missing_value=missing_value)
         if int8_var is not None:
             for dim in int8_var[target_variable].dims:
                 if dim.startswith(("x", "y")) and dim not in xy_chunks:
