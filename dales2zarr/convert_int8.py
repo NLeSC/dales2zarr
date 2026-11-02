@@ -8,7 +8,7 @@ import xarray as xr
 import zarr
 import yaml
 import numpy as np
-from dales2zarr.zarr_cast import cast_to_int8
+from dales2zarr.zarr_cast import cast_to_int8, scale_bounds
 
 DALES_INPUT_CONFIG = {
     "variables": {
@@ -115,7 +115,8 @@ def write_int8_dataset(datasets, input_config, outfile, mode, horizontal_chunks)
         source_variable = var_options.get('variable', target_variable)
         missing_value = var_options.get("missing_value", None)
         cast_option = var_options.get('mode', 'linear')
-        int8_var = cast_to_int8(ds, source_variable, target_variable, cast_option, missing_value=missing_value)
+        int8_var = cast_to_int8(ds, source_variable, target_variable, cast_option, missing_value=missing_value,
+                                data_min=var_options.get("data_min"), data_max=var_options.get("data_max"))
         if int8_var is not None:
             for dim in int8_var[target_variable].dims:
                 if dim.startswith(("x", "y")) and dim not in xy_chunks:
@@ -167,7 +168,7 @@ def main(arg_list=None):
 
     output_variables, xy_chunks = write_int8_dataset(datasets, input_config, outfile, args.mode,
                                                      args.horizontal_chunks)
-    write_coarsened_datasets(outfile, output_variables, xy_chunks, args.levels, args.coarsen)
+    write_coarsened_datasets(input_config, outfile, output_variables, xy_chunks, args.levels, args.coarsen)
 
 
 if __name__ == "__main__":

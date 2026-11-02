@@ -56,7 +56,7 @@ def normalize_data(data, data_min, data_max, mode, epsilon=1e-10):
     return np.clip(normalized_data, 0, 255).astype('uint8'), *scale_factors
 
 
-def cast_to_int8_3d(input_ds, var_name, mode='linear', epsilon=1e-10):
+def cast_to_int8_3d(input_ds, var_name, mode='linear', epsilon=1e-10, data_min=None, data_max=None, missing_value=None):
     """Convert 3d xarray to 8-bit integers.
 
     Args:
@@ -64,6 +64,8 @@ def cast_to_int8_3d(input_ds, var_name, mode='linear', epsilon=1e-10):
         var_name (str): The name of the variable to be converted.
         mode (str, optional): The mode used for normalization. Default is 'linear'.
         epsilon (float, optional): Offset used for the logarithmic mapping.
+        data_min (float, optional): Global minimum used for normalization. Computed from the data if not given.
+        data_max (float, optional): Global maximum used for normalization. Computed from the data if not given.
         missing_value (float, optional): The value to be treated as missing in the input variable.
 
     Returns: (xarray.Dataset)
@@ -79,7 +81,7 @@ def cast_to_int8_3d(input_ds, var_name, mode='linear', epsilon=1e-10):
         '[25, 50, 75]'
     """
     # Get the input data and compute the global minimum
-    glob_min = input_ds[var_name].min().values
+    glob_min = input_ds[var_name].min().values if data_min is None else data_min
     log.info(f'global minimum is {glob_min}')
 
     # Fill missing values with the global minimum
@@ -90,7 +92,7 @@ def cast_to_int8_3d(input_ds, var_name, mode='linear', epsilon=1e-10):
     log.info('layer maxes computed')
 
     # Compute the global maximum
-    glob_max = np.max(layer_maxes)
+    glob_max = np.max(layer_maxes) if data_max is None else data_max
     log.info(f'computed min and max: {glob_min}, {glob_max}')
 
     # Normalize the layer maxes and get the indices of the bottom and top layers
@@ -132,7 +134,7 @@ def cast_to_int8_3d(input_ds, var_name, mode='linear', epsilon=1e-10):
     return output
 
 
-def cast_to_int8_2d(input_ds, var_name, mode='linear', epsilon=1e-10):
+def cast_to_int8_2d(input_ds, var_name, mode='linear', epsilon=1e-10, data_min=None, data_max=None):
     """Converts a 2D variable in a given xarray Dataset to an 8-bit integer representation.
 
     Args:
@@ -140,6 +142,8 @@ def cast_to_int8_2d(input_ds, var_name, mode='linear', epsilon=1e-10):
         var_name (str): The name of the variable to be converted.
         mode (str, optional): The mode used for normalization. Default is 'linear'.
         epsilon (float, optional): Offset used for the logarithmic mapping.
+        data_min (float, optional): Global minimum used for normalization. Computed from the data if not given.
+        data_max (float, optional): Global maximum used for normalization. Computed from the data if not given.
 
     Returns: (xarray.Dataset)
         xarray.Dataset: A new dataset with the converted variable.
@@ -156,9 +160,9 @@ def cast_to_int8_2d(input_ds, var_name, mode='linear', epsilon=1e-10):
         output_ds = cast_to_8bit_integer_2d(input_ds, 'humidity', mode='log')
     """
     # Compute the global minimum and maximum values of the input variable
-    glob_min = input_ds[var_name].min().values
-    glob_max = input_ds[var_name].max().values
-    
+    glob_min = input_ds[var_name].min().values if data_min is None else data_min
+    glob_max = input_ds[var_name].max().values if data_max is None else data_max
+
     log.info(f'computed min and max: {glob_min}, {glob_max}')
 
     # Fill missing values with the global minimum
@@ -186,7 +190,8 @@ def cast_to_int8_2d(input_ds, var_name, mode='linear', epsilon=1e-10):
     return output
 
 
-def cast_to_int8(input_ds, input_var, output_var=None, mode='linear', epsilon=1e-10, missing_value=None):
+def cast_to_int8(input_ds, input_var, output_var=None, mode='linear', epsilon=1e-10, missing_value=None,
+                 data_min=None, data_max=None):
     """Casts a variable in the input dataset to an 8-bit integer.
 
     Args:
@@ -196,6 +201,8 @@ def cast_to_int8(input_ds, input_var, output_var=None, mode='linear', epsilon=1e
                                     If not provided, the input variable name will be used.
         mode (str, optional): The casting mode. Defaults to 'linear'.
         epsilon (float, optional): Offset used for the logarithmic mapping.
+        data_min (float, optional): Global minimum used for normalization. Computed from the data if not given.
+        data_max (float, optional): Global maximum used for normalization. Computed from the data if not given.
         missing_value (float, optional): The value to be treated as missing in the input variable.
 
     Returns:
@@ -213,5 +220,5 @@ def cast_to_int8(input_ds, input_var, output_var=None, mode='linear', epsilon=1e
         input_ds[var_name] = input_ds[var_name].where(input_ds[var_name] != float(missing_value), np.nan)
         input_ds[var_name].encoding['_FillValue'] = np.nan
     if "z" not in dims:
-        return cast_to_int8_2d(input_ds, var_name, mode, epsilon)
-    return cast_to_int8_3d(input_ds, var_name, mode, epsilon).rename_dims({"z": "z_" + var_name})
+        return cast_to_int8_2d(input_ds, var_name, mode, epsilon, data_min, data_max)
+    return cast_to_int8_3d(input_ds, var_name, mode, epsilon, data_min, data_max).rename_dims({"z": "z_" + var_name})
