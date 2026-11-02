@@ -8,7 +8,7 @@ import xarray as xr
 import zarr
 import yaml
 import numpy as np
-from dales2zarr.zarr_cast import cast_to_int8, scale_bounds
+from dales2zarr.zarr_cast import cast_filled_to_int8, prepare_data
 
 DALES_INPUT_CONFIG = {
     "variables": {
@@ -48,7 +48,8 @@ def parse_args(arg_list=None):
                         help="Write or append mode")
     parser.add_argument("--coarsen", metavar="mean|max|median", type=str, required=False, default="mean",
                         choices=["mean", "max", "median"],
-                        help="Coarsening method for LOD levels")
+                        help="Coarsening method for LOD levels, applied to the original data (so 'mean' is an "
+                             "arithmetic mean of the data, i.e. a geometric mean in int8 space for log-mapped variables)")
     parser.add_argument("--horizontal-chunks", metavar="INT", type=int, required=False, default=1,
                         dest="horizontal_chunks",
                         help="Number of chunks along each horizontal axis (time chunk is 1, z is unchunked)")
@@ -89,10 +90,11 @@ def load_datasets(args, input_config):
             if var_options.get("files", None) is not None:
                 ds = xr.open_mfdataset(filepath, chunks='auto', engine=var_options.get("engine", None), concat_dim=var_options.get("concat_dim", None), combine='nested' )
             else:
-                ds = xr.open_dataset(filepath, chunks='auto', engine=var_options.get("engine", None), missing_values=var_options.get("missing_value", None))
+                ds = xr.open_dataset(filepath, chunks='auto', engine=var_options.get("engine", None))
             if args.timestamps > 0:
                 ds = ds.isel(time=slice(0, args.timestamps))
-            datasets[target_variable] = ds.rename_dims(input_config.get("dimensions", {}))
+            renames = {k: v for k, v in input_config.get("dimensions", {}).items() if k in ds.dims}
+            datasets[target_variable] = ds.rename_dims(renames)
         except FileNotFoundError:
             logging.warning(f'Input file {filepath} not found for variable {target_variable}... skipping')
     return datasets
@@ -102,10 +104,13 @@ def write_int8_dataset(datasets, input_config, outfile, mode, horizontal_chunks)
     """Cast each variable to int8 and write it to `outfile` (zarr).
 
     Returns:
-        tuple: (list of written variable names, dict of horizontal chunk sizes)
+        tuple: (written variable names, horizontal chunk sizes, per-variable (data_min, data_max) used for
+        the cast, per-variable missing-value-filled data arrays to be used as base for coarsening)
     """
     # Process and write each variable immediately to avoid accumulating all data in memory
     output_variables = []
+    data_ranges = {}
+    filled_data = {}
     xy_chunks = {}  # horizontal chunk sizes, fixed by the first variable and shared by all variables and levels
     write_mode = mode
     for target_variable, var_options in input_config.get("variables", {}).items():
@@ -115,32 +120,44 @@ def write_int8_dataset(datasets, input_config, outfile, mode, horizontal_chunks)
         source_variable = var_options.get('variable', target_variable)
         missing_value = var_options.get("missing_value", None)
         cast_option = var_options.get('mode', 'linear')
-        int8_var = cast_to_int8(ds, source_variable, target_variable, cast_option, missing_value=missing_value,
-                                data_min=var_options.get("data_min"), data_max=var_options.get("data_max"))
-        if int8_var is not None:
-            for dim in int8_var[target_variable].dims:
-                if dim.startswith(("x", "y")) and dim not in xy_chunks:
-                    xy_chunks[dim] = math.ceil(int8_var.sizes[dim] / horizontal_chunks)
-            int8_var = int8_var.chunk(output_chunks(int8_var[target_variable], xy_chunks))
-            int8_var.to_zarr(outfile, mode=write_mode, encoding={target_variable: VAR_ENCODING})
-            output_variables.append(target_variable)
-            write_mode = "a"
-    return output_variables, xy_chunks
+        if source_variable not in ds:
+            logging.warning(f'Variable {source_variable} not found in the input dataset... skipping')
+            continue
+        data, data_min, data_max = prepare_data(ds, source_variable, target_variable, missing_value,
+                                                var_options.get("data_min"), var_options.get("data_max"))
+        int8_var = cast_filled_to_int8(data, data_min, data_max, cast_option)
+        filled_data[target_variable] = data
+        for dim in int8_var[target_variable].dims:
+            if dim.startswith(("x", "y")) and dim not in xy_chunks:
+                xy_chunks[dim] = math.ceil(int8_var.sizes[dim] / horizontal_chunks)
+        int8_var = int8_var.chunk(output_chunks(int8_var[target_variable], xy_chunks))
+        int8_var.to_zarr(outfile, mode=write_mode, encoding={target_variable: VAR_ENCODING})
+        output_variables.append(target_variable)
+        data_ranges[target_variable] = (data_min, data_max)
+        write_mode = "a"
+    return output_variables, xy_chunks, data_ranges, filled_data
 
 
-def write_coarsened_datasets(outfile, output_variables, xy_chunks, levels, coarsen):
-    """Coarsen the int8 zarr dataset `levels` times and write each level to its own zarr store."""
-    # Coarsen the dataset and write to zarr
+def write_coarsened_datasets(filled_data, input_config, outfile, output_variables, xy_chunks, data_ranges,
+                             levels, coarsen):
+    """Coarsen the input data `levels` times, cast it to int8 and write each level to its own zarr store.
+
+    Coarsening is done on the missing-value-filled original data returned by `write_int8_dataset`, so `mean`
+    is an arithmetic mean of the data. Every level is cast with the data range of the full-resolution variable,
+    so all levels share the same mapping to int8.
+    """
     # NOTE: coarsening assumes all output variables share the same horizontal grid resolution
-    ds = xr.open_zarr(outfile) if levels > 0 else None
-    for level in range(1, levels + 1):
-        coarsen_op = ds.coarsen({dim: 2 for dim in ds.dims if dim != "time"}, boundary="trim")
-        ds = getattr(coarsen_op, coarsen)()
-        level_outfile = outfile.replace(".zarr", f"-{level}.zarr")
-        for var in output_variables:
-            var_da = ds[var]
-            var_da.chunk(output_chunks(var_da, xy_chunks)).to_zarr(
-                level_outfile, mode="a", encoding={var: VAR_ENCODING})
+    for var in output_variables:
+        var_options = input_config["variables"][var]
+        data_min, data_max = data_ranges[var]
+        da = filled_data[var]
+        for level in range(1, levels + 1):
+            coarsen_op = da.coarsen({dim: 2 for dim in da.dims if dim != "time"}, boundary="trim")
+            da = getattr(coarsen_op, coarsen)()
+            int8_var = cast_filled_to_int8(da, data_min, data_max, var_options.get("mode", "linear"))
+            int8_var = int8_var.chunk(output_chunks(int8_var[var], xy_chunks))
+            level_outfile = outfile.replace(".zarr", f"-{level}.zarr")
+            int8_var.to_zarr(level_outfile, mode="a", encoding={var: VAR_ENCODING})
 
 
 def main(arg_list=None):
@@ -166,9 +183,10 @@ def main(arg_list=None):
     default_output_dir = args.input_dir if args.input_dir is not None else "."
     outfile = args.output if args.output is not None else os.path.join(default_output_dir, "output_int8.zarr")
 
-    output_variables, xy_chunks = write_int8_dataset(datasets, input_config, outfile, args.mode,
-                                                     args.horizontal_chunks)
-    write_coarsened_datasets(input_config, outfile, output_variables, xy_chunks, args.levels, args.coarsen)
+    output_variables, xy_chunks, data_ranges, filled_data = write_int8_dataset(datasets, input_config, outfile, args.mode,
+                                                                  args.horizontal_chunks)
+    write_coarsened_datasets(filled_data, input_config, outfile, output_variables, xy_chunks, data_ranges,
+                             args.levels, args.coarsen)
 
 
 if __name__ == "__main__":

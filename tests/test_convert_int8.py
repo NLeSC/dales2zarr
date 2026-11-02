@@ -61,7 +61,9 @@ def test_main_with_custom_config():
         xr.Dataset({'qr': (['zt', 'yt', 'xt'], qr_input_data)}).to_netcdf(
             os.path.join(temp_dir, "fielddump-qr.nc"))
 
-        input_config = {"ql": {"mode": "log"}, "qr": {"mode": "linear"}}
+        input_config = {"variables": {"ql": {"mode": "log", "file": "fielddump-ql.nc", "variable": "ql"},
+                                 "qr": {"mode": "linear", "file": "fielddump-qr.nc", "variable": "qr"}},
+                        "dimensions": {"xt": "x", "yt": "y", "zt": "z"}}
 
         with open(config_file, "w") as f:
             yaml.safe_dump(input_config, f)
@@ -113,7 +115,7 @@ def test_main_custom_filename_in_config():
         xr.Dataset({'ql': (['zt', 'yt', 'xt'], input_data)}).to_netcdf(
             os.path.join(temp_dir, "custom-ql.nc"))
 
-        input_config = {"ql": {"mode": "log", "file": "custom-ql.nc"}}
+        input_config = {"variables": {"ql": {"mode": "log", "file": "custom-ql.nc", "variable": "ql"}}, "dimensions": {"xt": "x", "yt": "y", "zt": "z"}}
         with open(config_file, "w") as f:
             yaml.safe_dump(input_config, f)
 
@@ -134,7 +136,7 @@ def test_main_with_thetavmix():
         xr.Dataset({'thetavmix': (['yt', 'xt'], input_data)}).to_netcdf(
             os.path.join(temp_dir, "cape-thetavmix.nc"))
 
-        input_config = {"thetavmix": {"mode": "linear"}}
+        input_config = {"variables": {"thetavmix": {"mode": "linear", "file": "cape-thetavmix.nc", "variable": "thetavmix"}}, "dimensions": {"xt": "x", "yt": "y", "zt": "z"}}
         with open(config_file, "w") as f:
             yaml.safe_dump(input_config, f)
 
@@ -143,3 +145,30 @@ def test_main_with_thetavmix():
         output_data = xr.open_zarr(output_file)
         assert "thetavmix" in output_data
         assert output_data["thetavmix"].dtype == "uint8"
+
+
+def test_main_data_min_used_for_missing_values():
+    """Test that a configured data_min is the fill value for missing data, also in the coarsened levels."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        output_file = os.path.join(temp_dir, "output.zarr")
+        config_file = os.path.join(temp_dir, "config.yaml")
+
+        input_data = np.array([[[-999.0, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]]])
+        xr.Dataset({'ql': (['zt', 'yt', 'xt'], input_data)}).to_netcdf(os.path.join(temp_dir, "fielddump-ql.nc"))
+
+        input_config = {"variables": {"ql": {"mode": "linear", "file": "fielddump-ql.nc", "variable": "ql",
+                                             "missing_value": "-999.", "data_min": 0.0, "data_max": 8.0}},
+                        "dimensions": {"xt": "x", "yt": "y", "zt": "z"}}
+        with open(config_file, "w") as f:
+            yaml.safe_dump(input_config, f)
+
+        main(["--input-dir", temp_dir, "--output", output_file, "--config", config_file, "--levels", "1"])
+
+        # The masked data minimum is 2, but the configured data_min of 0 must be used for the mapping and filling
+        codes = xr.open_zarr(output_file)["ql"].values
+        assert codes.flat[0] == 0
+        assert codes.flat[1] == int(2.0 / 8.0 * 255)
+
+        # The coarsened level is the mean of the filled data (the missing value counting as 0)
+        coarse = xr.open_zarr(os.path.join(temp_dir, "output-1.zarr"))["ql"].values
+        assert coarse.flat[0] == int(np.mean([0, 2, 3, 4, 5, 6, 7, 8]) / 8.0 * 255)

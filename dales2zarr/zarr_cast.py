@@ -5,6 +5,7 @@ unsigned 8-bit integer values, suitable for visualization.
 """
 import logging
 import math
+import dask
 import numpy as np
 import xarray as xr
 
@@ -56,75 +57,83 @@ def normalize_data(data, data_min, data_max, mode, epsilon=1e-10):
     return np.clip(normalized_data, 0, 255).astype('uint8'), *scale_factors
 
 
-def cast_to_int8_3d(input_ds, var_name, mode='linear', epsilon=1e-10, data_min=None, data_max=None, missing_value=None):
-    """Convert 3d xarray to 8-bit integers.
+def prepare_data(input_ds, var_name, output_var=None, missing_value=None, data_min=None, data_max=None):
+    """Select a variable, fill its missing values and determine its global range.
+
+    This is done once, at the finest resolution. The result can be reused for all coarsened levels.
+    Missing values (NaN or `missing_value`) are replaced by the global minimum.
 
     Args:
-        input_ds (xarray.Dataset): Input xarray dataset
-        var_name (str): The name of the variable to be converted.
+        input_ds (xarray.Dataset): The input dataset.
+        var_name (str): The name of the variable to select.
+        output_var (str, optional): Name of the returned array. Defaults to `var_name`.
+        missing_value (float, optional): The value to be treated as missing in the input variable.
+        data_min (float, optional): Global minimum. Computed from the data if not given.
+        data_max (float, optional): Global maximum. Computed from the data if not given.
+
+    Returns:
+        tuple (xarray.DataArray, float, float): The filled data, the global minimum and the global maximum.
+    """
+    data = input_ds[var_name].rename(var_name if output_var is None else output_var)
+    if missing_value is not None:
+        data = data.where(data != float(missing_value))
+    glob_min = data.min() if data_min is None else data_min
+    glob_max = data.max() if data_max is None else data_max
+    glob_min, glob_max = (float(v) for v in dask.compute(glob_min, glob_max))
+    log.info(f'global min and max: {glob_min}, {glob_max}')
+    return data.fillna(glob_min), glob_min, glob_max
+
+
+def cast_to_int8_3d(data, data_min, data_max, mode='linear', epsilon=1e-10):
+    """Convert a 3d array (without missing values) to 8-bit integers, trimming empty z levels.
+
+    Args:
+        data (xarray.DataArray): Named input array with dimensions (time,) z, y, x.
+        data_min (float): Global minimum used for normalization.
+        data_max (float): Global maximum used for normalization.
         mode (str, optional): The mode used for normalization. Default is 'linear'.
         epsilon (float, optional): Offset used for the logarithmic mapping.
-        data_min (float, optional): Global minimum used for normalization. Computed from the data if not given.
-        data_max (float, optional): Global maximum used for normalization. Computed from the data if not given.
-        missing_value (float, optional): The value to be treated as missing in the input variable.
 
-    Returns: (xarray.Dataset)
+    Returns:
         xarray.Dataset: A new dataset with the converted variable.
 
     Raises:
         ValueError: If `mode` is not `linear` or `log`.
-
-    Example:
-        This function can be called as follows:
-        >>> from dales2zarr.my_module import cast_to_8bit_integer_3d
-        >>> cast_to_8bit_integer_3d([1.0, 2.0, 3.0], 0.0, 10.0, 'linear')
-        '[25, 50, 75]'
     """
-    # Get the input data and compute the global minimum
-    glob_min = input_ds[var_name].min().values if data_min is None else data_min
-    log.info(f'global minimum is {glob_min}')
-
-    # Fill missing values with the global minimum
-    input_data = input_ds[var_name].fillna(glob_min)
-
+    var_name = data.name
     # Compute the maximum values for each horizontal layer
-    layer_maxes = input_data.max(['x', 'y']).values
+    layer_maxes = data.max(['x', 'y']).values
     log.info('layer maxes computed')
 
-    # Compute the global maximum
-    glob_max = np.max(layer_maxes) if data_max is None else data_max
-    log.info(f'computed min and max: {glob_min}, {glob_max}')
-
     # Normalize the layer maxes and get the indices of the bottom and top layers
-    norms, _, _ = normalize_data(layer_maxes, glob_min, glob_max, mode, epsilon)
+    norms, _, _ = normalize_data(layer_maxes, data_min, data_max, mode, epsilon)
     nonzero_layers = np.flatnonzero(norms.reshape(-1, norms.shape[-1]).max(axis=0))
     kbot, ktop = (int(nonzero_layers[0]), int(nonzero_layers[-1])) if nonzero_layers.size else (-1, -1)
     log.info(f'computed kbot and ktop: {kbot}, {ktop}')
 
     # Get the heights associated with the bottom and top layers
-    zbot, ztop = input_data.z[kbot].values, input_data.z[ktop].values
+    zbot, ztop = data.z[kbot].values, data.z[ktop].values
     log.info(f'computed associated heights are: {zbot}, {ztop}')
 
     # Create a new array with the appropriate shape
-    new_shape = list(input_data.shape)
+    new_shape = list(data.shape)
     z_index = 0 if len(new_shape) == 3 else 1
     new_shape[z_index] = ktop - kbot + 1
     arr = np.zeros(new_shape, dtype='uint8')
 
     # Convert each time slice to 8-bit integers
-    if 'time' in input_ds.sizes:
-        ntimes = input_ds.sizes['time']
+    if 'time' in data.dims:
+        ntimes = data.sizes['time']
         for itime in range(ntimes):
             log.info(f'Converting time slice {itime} from {ntimes}...')
-            arr[itime, ...], s1, s2 = normalize_data(input_data.isel(time=itime).isel(z=slice(kbot, ktop + 1)),
-                                                     glob_min, glob_max, mode, epsilon)
+            arr[itime, ...], s1, s2 = normalize_data(data.isel(time=itime).isel(z=slice(kbot, ktop + 1)),
+                                                     data_min, data_max, mode, epsilon)
     else:
         log.info("Converting single time slice...")
-        arr[...], s1, s2 = normalize_data(input_data.isel(z=slice(kbot, ktop + 1)),
-                                          glob_min, glob_max, mode, epsilon)
+        arr[...], s1, s2 = normalize_data(data.isel(z=slice(kbot, ktop + 1)), data_min, data_max, mode, epsilon)
 
     # Create a new dataset with the converted variable
-    output = input_data.isel(z=slice(kbot, ktop + 1)).to_dataset()
+    output = data.isel(z=slice(kbot, ktop + 1)).to_dataset()
     output[var_name].values = arr
     output.attrs['lower_bound'] = s1
     output.attrs['upper_bound'] = s2
@@ -134,60 +143,53 @@ def cast_to_int8_3d(input_ds, var_name, mode='linear', epsilon=1e-10, data_min=N
     return output
 
 
-def cast_to_int8_2d(input_ds, var_name, mode='linear', epsilon=1e-10, data_min=None, data_max=None):
-    """Converts a 2D variable in a given xarray Dataset to an 8-bit integer representation.
+def cast_to_int8_2d(data, data_min, data_max, mode='linear', epsilon=1e-10):
+    """Convert a 2D array (without missing values) to an 8-bit integer representation.
 
     Args:
-        input_ds (xarray.Dataset): The input dataset containing the variable to be converted.
-        var_name (str): The name of the variable to be converted.
+        data (xarray.DataArray): Named input array.
+        data_min (float): Global minimum used for normalization.
+        data_max (float): Global maximum used for normalization.
         mode (str, optional): The mode used for normalization. Default is 'linear'.
         epsilon (float, optional): Offset used for the logarithmic mapping.
-        data_min (float, optional): Global minimum used for normalization. Computed from the data if not given.
-        data_max (float, optional): Global maximum used for normalization. Computed from the data if not given.
 
-    Returns: (xarray.Dataset)
+    Returns:
         xarray.Dataset: A new dataset with the converted variable.
 
     Raises:
         ValueError: If `mode` is not `linear` or `log`.
-
-    Examples:
-        # Convert a 2D variable named 'temperature' in the input dataset to an 8-bit integer representation:
-        output_ds = cast_to_8bit_integer_2d(input_ds, 'temperature')
-
-        # Convert a 2D variable named 'humidity' in the input dataset to an 8-bit integer representation:
-        # using 'log' mode:
-        output_ds = cast_to_8bit_integer_2d(input_ds, 'humidity', mode='log')
     """
-    # Compute the global minimum and maximum values of the input variable
-    glob_min = input_ds[var_name].min().values if data_min is None else data_min
-    glob_max = input_ds[var_name].max().values if data_max is None else data_max
-
-    log.info(f'computed min and max: {glob_min}, {glob_max}')
-
-    # Fill missing values with the global minimum
-    input_data = input_ds[var_name].fillna(glob_min)
-
+    var_name = data.name
     # Create an array of zeros with the same shape as the input variable
-    arr = np.zeros(list(input_data.shape), dtype='uint8')
+    arr = np.zeros(list(data.shape), dtype='uint8')
 
     # Convert each time slice of the input variable to 8-bit integers
-    if 'time' in input_ds.sizes:
-        num_times = input_ds.sizes['time']
+    if 'time' in data.dims:
+        num_times = data.sizes['time']
         for itime in range(num_times):
             log.info(f'Converting time slice {itime} from {num_times}...')
-            arr[itime,...], s1, s2 =  normalize_data(input_data.isel(time=itime),
-                                                     glob_min, glob_max, mode, epsilon)
+            arr[itime, ...], s1, s2 = normalize_data(data.isel(time=itime), data_min, data_max, mode, epsilon)
     else:
         log.info('Converting single time slice...')
-        arr[...], s1, s2 =  normalize_data(input_data, glob_min, glob_max, mode, epsilon)
+        arr[...], s1, s2 = normalize_data(data, data_min, data_max, mode, epsilon)
 
     # Create a new dataset with the converted variable
-    output = input_data.to_dataset()
+    output = data.to_dataset()
     output[var_name].values = arr
     output.attrs['lower_bound'] = s1
     output.attrs['upper_bound'] = s2
     return output
+
+
+def cast_filled_to_int8(data, data_min, data_max, mode='linear', epsilon=1e-10):
+    """Cast a prepared array (see `prepare_data`) to 8-bit integers, dispatching on its dimensionality.
+
+    Returns:
+        xarray.Dataset: A dataset with the casted variable; the z dimension is renamed to `z_<name>`.
+    """
+    if "z" not in data.dims:
+        return cast_to_int8_2d(data, data_min, data_max, mode, epsilon)
+    return cast_to_int8_3d(data, data_min, data_max, mode, epsilon).rename_dims({"z": "z_" + data.name})
 
 
 def cast_to_int8(input_ds, input_var, output_var=None, mode='linear', epsilon=1e-10, missing_value=None,
@@ -201,24 +203,15 @@ def cast_to_int8(input_ds, input_var, output_var=None, mode='linear', epsilon=1e
                                     If not provided, the input variable name will be used.
         mode (str, optional): The casting mode. Defaults to 'linear'.
         epsilon (float, optional): Offset used for the logarithmic mapping.
+        missing_value (float, optional): The value to be treated as missing in the input variable.
         data_min (float, optional): Global minimum used for normalization. Computed from the data if not given.
         data_max (float, optional): Global maximum used for normalization. Computed from the data if not given.
-        missing_value (float, optional): The value to be treated as missing in the input variable.
 
     Returns:
-        xarray.Dataset: The input dataset with the variable casted to an 8-bit integer.
+        xarray.Dataset: The input variable casted to an 8-bit integer, or None if it is not in the dataset.
     """
     if input_var not in input_ds.keys():
         log.warning(f'Variable {input_var} not found in the input dataset... skipping')
         return None
-    var_name = input_var if output_var is None else output_var
-    if var_name != input_var:
-        log.info(f'Converting variable {input_var} to {var_name}...')
-        input_ds = input_ds.rename_vars({input_var: var_name})
-    dims = input_ds[var_name].dims
-    if missing_value is not None:
-        input_ds[var_name] = input_ds[var_name].where(input_ds[var_name] != float(missing_value), np.nan)
-        input_ds[var_name].encoding['_FillValue'] = np.nan
-    if "z" not in dims:
-        return cast_to_int8_2d(input_ds, var_name, mode, epsilon, data_min, data_max)
-    return cast_to_int8_3d(input_ds, var_name, mode, epsilon, data_min, data_max).rename_dims({"z": "z_" + var_name})
+    data, data_min, data_max = prepare_data(input_ds, input_var, output_var, missing_value, data_min, data_max)
+    return cast_filled_to_int8(data, data_min, data_max, mode, epsilon)

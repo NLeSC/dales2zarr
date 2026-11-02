@@ -4,8 +4,6 @@ import pandas as pd
 import pytest
 import xarray as xr
 from dales2zarr.zarr_cast import cast_to_int8
-from dales2zarr.zarr_cast import cast_to_int8_2d
-from dales2zarr.zarr_cast import cast_to_int8_3d
 from dales2zarr.zarr_cast import normalize_data
 
 # These tests have been created with the help of github copilot
@@ -87,7 +85,7 @@ def test_cast_to_int8():
     input_ds = xr.Dataset({'temperature': (['yt', 'xt'], input_data)})
 
     # Call the function to convert the variable to 8-bit integers
-    output_ds = cast_to_int8_2d(input_ds, 'temperature')
+    output_ds = cast_to_int8(input_ds, 'temperature')
 
     # Check the output dataset
     expected_data = np.array([[0, 51, 102], [153, 204, 255]], dtype='uint8')
@@ -130,7 +128,7 @@ def test_cast_to_int8_2d_attrs():
     input_ds = xr.Dataset({'temperature': (['yt', 'xt'], input_data)})
 
     # Call the function to convert the variable to 8-bit integers
-    output_ds = cast_to_int8_2d(input_ds, 'temperature')
+    output_ds = cast_to_int8(input_ds, 'temperature')
 
     # Check the output dataset
     assert output_ds.attrs['lower_bound'] == 1.0
@@ -155,7 +153,7 @@ def test_cast_to_int8_2d_time_dep():
                           coords={'time': time})
 
     # Call the function to convert the variable to 8-bit integers
-    output_ds = cast_to_int8_2d(input_ds, 'temperature')
+    output_ds = cast_to_int8(input_ds, 'temperature')
 
     # Check the output dataset
     expected_data = np.array([[[0, 23, 46], [69, 92, 115]],
@@ -182,7 +180,7 @@ def test_cast_to_int8_2d_time_dep_attrs():
                           coords={'time': time})
 
     # Call the function to convert the variable to 8-bit integers
-    output_ds = cast_to_int8_2d(input_ds, 'temperature')
+    output_ds = cast_to_int8(input_ds, 'temperature')
 
     assert output_ds.attrs['lower_bound'] == 1.0
     assert output_ds.attrs['upper_bound'] == 12.0
@@ -202,11 +200,11 @@ def test_cast_to_int8_3d_time_dep():
     input_data = np.array([[[[1.0, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]], [[0.0, 0.0], [0.0, 0.0]]],
                            [[[9.0, 10.0], [11.0, 12.0]], [[13.0, 14.0], [15.0, 16.0]], [[0.0, 0.0], [0.0, 0.0]]]])
     time = pd.date_range('2022-01-01', periods=2)
-    input_ds = xr.Dataset({'temperature': (['time', 'zt', 'yt', 'xt'], input_data)},
-                          coords={'time': time, 'zt': [0.0, 1500.0, 3200.0], 'yt': [0, 1], 'xt': [0, 1]})
+    input_ds = xr.Dataset({'temperature': (['time', 'z', 'y', 'x'], input_data)},
+                          coords={'time': time, 'z': [0.0, 1500.0, 3200.0], 'y': [0, 1], 'x': [0, 1]})
 
     # Call the function to convert the variable to 8-bit integers
-    output_ds = cast_to_int8_3d(input_ds, 'temperature')
+    output_ds = cast_to_int8(input_ds, 'temperature')
 
     # Check the output dataset
     expected_data = np.array([[[[15, 31], [47, 63]], [[79, 95], [111, 127]]],
