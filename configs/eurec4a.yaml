@@ -5,5 +5,7 @@ variables:
     variable: qc
     concat_dim: time
     missing_value: "-999."
+    data_min: 0.0
+    data_max: 0.004413767252117395
 dimensions:
   zu_3d: z
