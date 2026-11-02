@@ -75,26 +75,12 @@ def output_chunks(da, xy_chunks):
     return chunks
 
 
-def main(arg_list=None):
-    """Convert the input dataset to int8 and save it in zarr format.
+# Zarr encoding: Blosc-compressed uint8
+VAR_ENCODING = {"dtype": "uint8", "compressor": zarr.Blosc(cname="lz4", clevel=6, shuffle=zarr.Blosc.BITSHUFFLE)}
 
-    Args:
-        arg_list (list, optional): List of command-line arguments. Defaults to None, in which case sys.argv[1:] is used.
 
-    Returns:
-        None
-    """
-    logging.basicConfig(level=logging.INFO)
-    # Parse command-line arguments
-    args = parse_args(arg_list)
-
-    if args.config is None:
-        input_config = EUREC4A_INPUT_CONFIG
-    else:
-        # Read the input configuration from yaml
-        with open(args.config, "r") as f:
-            input_config = yaml.safe_load(f)
-
+def load_datasets(args, input_config):
+    """Open per-variable datasets from their input files; returns a dict keyed by target variable."""
     # Open per-variable datasets from their respective input files
     datasets = {}
     for target_variable, var_options in input_config.get("variables", {}).items():
@@ -116,18 +102,19 @@ def main(arg_list=None):
             datasets[target_variable] = ds.rename_dims(input_config.get("dimensions", {}))
         except FileNotFoundError:
             logging.warning(f'Input file {filepath} not found for variable {target_variable}... skipping')
+    return datasets
 
-    default_output_dir = args.input_dir if args.input_dir is not None else "."
-    outfile = args.output if args.output is not None else os.path.join(default_output_dir, "output_int8.zarr")
 
-    # Write the result to zarr with Blosc compression
-    compressor = zarr.Blosc(cname="lz4", clevel=6, shuffle=zarr.Blosc.BITSHUFFLE)
-    var_encoding = {"dtype": "uint8", "compressor": compressor}
+def write_int8_dataset(datasets, input_config, outfile, mode, horizontal_chunks):
+    """Cast each variable to int8 and write it to `outfile` (zarr).
 
+    Returns:
+        tuple: (list of written variable names, dict of horizontal chunk sizes)
+    """
     # Process and write each variable immediately to avoid accumulating all data in memory
     output_variables = []
     xy_chunks = {}  # horizontal chunk sizes, fixed by the first variable and shared by all variables and levels
-    write_mode = args.mode
+    write_mode = mode
     for target_variable, var_options in input_config.get("variables", {}).items():
         ds = datasets.get(target_variable)
         if ds is None:
@@ -139,23 +126,55 @@ def main(arg_list=None):
         if int8_var is not None:
             for dim in int8_var[target_variable].dims:
                 if dim.startswith(("x", "y")) and dim not in xy_chunks:
-                    xy_chunks[dim] = math.ceil(int8_var.sizes[dim] / args.horizontal_chunks)
+                    xy_chunks[dim] = math.ceil(int8_var.sizes[dim] / horizontal_chunks)
             int8_var = int8_var.chunk(output_chunks(int8_var[target_variable], xy_chunks))
-            int8_var.to_zarr(outfile, mode=write_mode, encoding={target_variable: var_encoding})
+            int8_var.to_zarr(outfile, mode=write_mode, encoding={target_variable: VAR_ENCODING})
             output_variables.append(target_variable)
             write_mode = "a"
+    return output_variables, xy_chunks
 
+
+def write_coarsened_datasets(outfile, output_variables, xy_chunks, levels, coarsen):
+    """Coarsen the int8 zarr dataset `levels` times and write each level to its own zarr store."""
     # Coarsen the dataset and write to zarr
     # NOTE: coarsening assumes all output variables share the same horizontal grid resolution
-    ds = xr.open_zarr(outfile) if args.levels > 0 else None
-    for level in range(1, args.levels + 1):
+    ds = xr.open_zarr(outfile) if levels > 0 else None
+    for level in range(1, levels + 1):
         coarsen_op = ds.coarsen({dim: 2 for dim in ds.dims if dim != "time"}, boundary="trim")
-        ds = getattr(coarsen_op, args.coarsen)()
+        ds = getattr(coarsen_op, coarsen)()
         level_outfile = outfile.replace(".zarr", f"-{level}.zarr")
         for var in output_variables:
             var_da = ds[var]
             var_da.chunk(output_chunks(var_da, xy_chunks)).to_zarr(
-                level_outfile, mode="a", encoding={var: var_encoding})
+                level_outfile, mode="a", encoding={var: VAR_ENCODING})
+
+
+def main(arg_list=None):
+    """Convert the input dataset to int8 and save it in zarr format.
+
+    Args:
+        arg_list (list, optional): List of command-line arguments. Defaults to None, in which case sys.argv[1:] is used.
+
+    Returns:
+        None
+    """
+    logging.basicConfig(level=logging.INFO)
+    args = parse_args(arg_list)
+
+    if args.config is None:
+        input_config = DEFAULT_INPUT_CONFIG
+    else:
+        with open(args.config, "r") as f:
+            input_config = yaml.safe_load(f)
+
+    datasets = load_datasets(args, input_config)
+
+    default_output_dir = args.input_dir if args.input_dir is not None else "."
+    outfile = args.output if args.output is not None else os.path.join(default_output_dir, "output_int8.zarr")
+
+    output_variables, xy_chunks = write_int8_dataset(datasets, input_config, outfile, args.mode,
+                                                     args.horizontal_chunks)
+    write_coarsened_datasets(outfile, output_variables, xy_chunks, args.levels, args.coarsen)
 
 
 if __name__ == "__main__":
