@@ -1,0 +1,9 @@
+variables:
+  ql:
+    mode: log
+    files: "EUREC4A_highres.3d.*.nc"
+    variable: qc
+    concat_dim: time
+    missing_value: "-999."
+dimensions:
+  zu_3d: z

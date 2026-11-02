@@ -10,20 +10,13 @@ import yaml
 import numpy as np
 from dales2zarr.zarr_cast import cast_to_int8
 
-DEFAULT_INPUT_CONFIG = {
+DALES_INPUT_CONFIG = {
     "variables": {
         "ql":       {"mode": "log",    "file": "fielddump-ql.nc", "variable": "ql"},
         "qr":       {"mode": "linear", "file": "fielddump-qr.nc", "variable": "sv002"},
         "thetavmix":{"mode": "linear", "file": "cape-thetavmix.nc", "variable": "thetavmix"},
     },
     "dimensions": {"xt": "x", "yt": "y", "zt": "z"}
-}
-
-EUREC4A_INPUT_CONFIG = {
-    "variables": {
-        "ql":       {"mode": "log",    "files": "EUREC4A_highres.3d.*.nc", "variable": "qc", "concat_dim": "time", "missing_value": "-999."},
-    },
-    "dimensions": {"zu_3d": "z"}
 }
 
 
@@ -162,7 +155,7 @@ def main(arg_list=None):
     args = parse_args(arg_list)
 
     if args.config is None:
-        input_config = DEFAULT_INPUT_CONFIG
+        input_config = DALES_INPUT_CONFIG
     else:
         with open(args.config, "r") as f:
             input_config = yaml.safe_load(f)
