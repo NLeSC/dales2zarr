@@ -4,6 +4,7 @@ import argparse
 import logging
 import math
 import os
+import psutil
 import xarray as xr
 import zarr
 import yaml
@@ -153,6 +154,43 @@ def write_int8_dataset(datasets, input_config, outfile, mode, horizontal_chunks)
     return output_variables, xy_chunks, data_ranges, z_ranges, filled_data
 
 
+# Default fraction of the currently available memory that a cached coarsened level may occupy; can be overridden
+# with the environment variable named below.
+CACHE_MEMORY_FRACTION = 0.5
+CACHE_MEMORY_FRACTION_ENV = "DALES2ZARR_CACHE_MEMORY_FRACTION"
+
+
+def cache_memory_fraction():
+    """Return the memory fraction for caching, from the environment variable if set and valid."""
+    value = os.environ.get(CACHE_MEMORY_FRACTION_ENV)
+    if value is None:
+        return CACHE_MEMORY_FRACTION
+    try:
+        fraction = float(value)
+    except ValueError:
+        fraction = None
+    if fraction is None or not 0 <= fraction <= 1:
+        logging.warning(f'Ignoring invalid {CACHE_MEMORY_FRACTION_ENV}={value!r} (expected a number in [0, 1]), '
+                        f'using {CACHE_MEMORY_FRACTION}')
+        return CACHE_MEMORY_FRACTION
+    return fraction
+
+
+def fits_in_memory(da, fraction=None):
+    """Return True if `da` can be loaded eagerly using at most `fraction` of the available memory.
+
+    `fraction` defaults to the value of the environment variable DALES2ZARR_CACHE_MEMORY_FRACTION, or 0.5.
+    """
+    if fraction is None:
+        fraction = cache_memory_fraction()
+    available = psutil.virtual_memory().available
+    fits = da.nbytes <= fraction * available
+    if not fits:
+        logging.info(f'Not caching {da.name}: needs {da.nbytes / 2**20:.0f} MiB, '
+                     f'{available / 2**20:.0f} MiB available (fraction {fraction})')
+    return fits
+
+
 def write_coarsened_datasets(filled_data, input_config, outfile, output_variables, xy_chunks, data_ranges,
                              z_ranges, levels, coarsen):
     """Coarsen the input data `levels` times, cast it to int8 and write each level to its own zarr store.
@@ -160,7 +198,8 @@ def write_coarsened_datasets(filled_data, input_config, outfile, output_variable
     Coarsening is done on the missing-value-filled original data returned by `write_int8_dataset`, so `mean`
     is an arithmetic mean of the data. Every level is cast with the data range and the bottom and top z layers
     of the full-resolution variable, so all levels share the same mapping to int8. Only the horizontal
-    dimensions are coarsened.
+    dimensions are coarsened. A coarsened level that is the input of the next level is loaded into memory
+    (cached) if enough memory is available, otherwise it stays lazy and is recomputed when needed.
     """
     # NOTE: coarsening assumes all output variables share the same horizontal grid resolution
     for var in output_variables:
@@ -172,6 +211,8 @@ def write_coarsened_datasets(filled_data, input_config, outfile, output_variable
             logging.info(f'Coarsening variable {var} to level {level}')
             coarsen_op = da.coarsen({dim: 2 for dim in da.dims if dim.startswith(("x", "y"))}, boundary="trim")
             da = getattr(coarsen_op, coarsen)()
+            if level < levels and fits_in_memory(da):
+                da = da.load()
             int8_var = cast_filled_to_int8(da, data_min, data_max, var_options.get("mode", "linear"),
                                            z_range=z_range)
             int8_var = int8_var.chunk(output_chunks(int8_var[var], xy_chunks))
