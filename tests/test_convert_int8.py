@@ -202,3 +202,125 @@ def test_main_data_min_used_for_missing_values():
         coarse = xr.open_zarr(os.path.join(temp_dir, "output-1.zarr"))["ql"].values
         assert coarse.shape[-3:] == (2, 1, 1)
         assert coarse.flat[0] == int(np.mean([0, 2, 3, 4]) / 8.0 * 255)
+
+
+def _write_time_input(temp_dir, times, offset=0.0, seed=0):
+    data = np.random.default_rng(seed).random((len(times), 4, 4, 4)) + offset
+    ds = xr.Dataset({"ql": (["time", "zt", "yt", "xt"], data)}, coords={"time": np.array(times, dtype="datetime64[ns]")})
+    ds.to_netcdf(os.path.join(temp_dir, "fielddump-ql.nc"))
+    return data
+
+
+def test_main_append_skips_written_timestamps():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        output_file = os.path.join(temp_dir, "output.zarr")
+        lod1_file = os.path.join(temp_dir, "output-1.zarr")
+        args = ["--input-dir", temp_dir, "--output", output_file, "--levels", "1"]
+
+        _write_time_input(temp_dir, ["2020-01-01T00", "2020-01-01T01"])
+        main(args)
+        first = xr.open_zarr(output_file)["ql"].values
+        first_lod1 = xr.open_zarr(lod1_file)["ql"].values
+
+        # Same time stamps again: nothing is rewritten (the changed data must not end up on disk)
+        _write_time_input(temp_dir, ["2020-01-01T00", "2020-01-01T01"], offset=5.0)
+        main(args)
+        assert np.array_equal(xr.open_zarr(output_file)["ql"].values, first)
+        assert np.array_equal(xr.open_zarr(lod1_file)["ql"].values, first_lod1)
+
+        # One new time stamp is appended, existing ones are untouched
+        _write_time_input(temp_dir, ["2020-01-01T00", "2020-01-01T01", "2020-01-01T02"])
+        main(args)
+        for store, shape in ((output_file, (3, 4, 4, 4)), (lod1_file, (3, 4, 2, 2))):
+            ds = xr.open_zarr(store)
+            assert ds["ql"].shape == shape
+            assert ds["time"].values.tolist() == np.array(
+                ["2020-01-01T00", "2020-01-01T01", "2020-01-01T02"], dtype="datetime64[ns]").tolist()
+        assert np.array_equal(xr.open_zarr(output_file)["ql"].values[:2], first)
+        assert np.array_equal(xr.open_zarr(lod1_file)["ql"].values[:2], first_lod1)
+
+
+def test_main_overwrite_mode_overwrites_written_timestamps():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        output_file = os.path.join(temp_dir, "output.zarr")
+        args = ["--input-dir", temp_dir, "--output", output_file, "--mode", "o"]
+        _write_time_input(temp_dir, ["2020-01-01T00"])
+        main(args)
+        _write_time_input(temp_dir, ["2020-01-01T00"], offset=5.0)
+        main(args)
+        assert xr.open_zarr(output_file)["ql"].shape == (1, 4, 4, 4)
+
+
+def test_main_timestamps_limits_appended_timestamps():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        times = ["2020-01-01T00", "2020-01-01T01", "2020-01-01T02"]
+        _write_time_input(temp_dir, times)
+        full_file = os.path.join(temp_dir, "full.zarr")
+        main(["--input-dir", temp_dir, "--output", full_file, "--levels", "1"])
+
+        step_file = os.path.join(temp_dir, "step.zarr")
+        args = ["--input-dir", temp_dir, "--output", step_file, "--levels", "1", "--timestamps", "1"]
+        for expected in (1, 2, 3, 3):
+            main(args)
+            assert xr.open_zarr(step_file)["ql"].sizes["time"] == expected
+
+        # ranges are computed over the full input, so appending step by step equals a single full run
+        for suffix in (".zarr", "-1.zarr"):
+            full = xr.open_zarr(full_file.replace(".zarr", suffix))
+            step = xr.open_zarr(step_file.replace(".zarr", suffix))
+            assert np.array_equal(full["ql"].values, step["ql"].values)
+
+
+def test_main_overwrite_mode_replaces_main_and_level_stores():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        output_file = os.path.join(temp_dir, "output.zarr")
+        lod1_file = os.path.join(temp_dir, "output-1.zarr")
+        args = ["--input-dir", temp_dir, "--output", output_file, "--levels", "1", "--mode", "o"]
+        times = ["2020-01-01T00", "2020-01-01T01", "2020-01-01T02"]
+
+        _write_time_input(temp_dir, times, seed=0)
+        main(args)
+
+        # Reference result of the second input, written to a separate output
+        _write_time_input(temp_dir, times, seed=1)
+        ref_file = os.path.join(temp_dir, "ref.zarr")
+        main(["--input-dir", temp_dir, "--output", ref_file, "--levels", "1"])
+
+        # Same time stamps, different data: both stores are overwritten instead of skipped
+        main(args)
+        for suffix in (".zarr", "-1.zarr"):
+            written = xr.open_zarr(output_file.replace(".zarr", suffix))
+            ref = xr.open_zarr(ref_file.replace(".zarr", suffix))
+            assert written["ql"].sizes["time"] == 3
+            assert np.array_equal(written["ql"].values, ref["ql"].values)
+
+        # With a time stamp limit the main store is recreated and the level variable replaced; nothing is appended
+        main(args + ["--timestamps", "1"])
+        for suffix in (".zarr", "-1.zarr"):
+            written = xr.open_zarr(output_file.replace(".zarr", suffix))
+            ref = xr.open_zarr(ref_file.replace(".zarr", suffix))
+            assert written["ql"].sizes["time"] == 1
+            assert np.array_equal(written["ql"].values, ref["ql"].values[:1])
+
+
+def test_main_timestamps_limit_smaller_than_new_timestamps_in_partially_filled_store():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        times = np.array(["2020-01-01T00", "2020-01-01T01", "2020-01-01T02", "2020-01-01T03", "2020-01-01T04"],
+                         dtype="datetime64[ns]")
+        _write_time_input(temp_dir, times)
+        full_file = os.path.join(temp_dir, "full.zarr")
+        main(["--input-dir", temp_dir, "--output", full_file, "--levels", "1"])
+
+        step_file = os.path.join(temp_dir, "step.zarr")
+        args = ["--input-dir", temp_dir, "--output", step_file, "--levels", "1", "--timestamps", "2"]
+        # 2 of 5 stored; then 3 new with a limit of 2; then 1 new with a limit of 2
+        for expected in (2, 4, 5):
+            main(args)
+            for suffix in (".zarr", "-1.zarr"):
+                step = xr.open_zarr(step_file.replace(".zarr", suffix))
+                assert step["time"].values.tolist() == times[:expected].tolist()
+
+        for suffix in (".zarr", "-1.zarr"):
+            full = xr.open_zarr(full_file.replace(".zarr", suffix))
+            step = xr.open_zarr(step_file.replace(".zarr", suffix))
+            assert np.array_equal(full["ql"].values, step["ql"].values)

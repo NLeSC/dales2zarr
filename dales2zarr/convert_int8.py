@@ -44,9 +44,10 @@ def parse_args(arg_list=None):
     parser.add_argument("--levels", metavar="INT", type=int, required=False, default=0, 
                         help="Number of coarsening levels")
     parser.add_argument("--timestamps" , metavar="INT", type=int, required=False, default=0,
-                        help="Number of timestamps to keep")
-    parser.add_argument("--mode", metavar="w|a", type=str, required=False, default="a", choices=["w", "a"],
-                        help="Write or append mode")
+                        help="Number of timestamps to append to the output (0: all new timestamps). Data ranges "
+                             "are always computed over the full time range of the input")
+    parser.add_argument("--mode", metavar="o|a", type=str, required=False, default="a", choices=["o", "a"],
+                        help="Overwrite (o) or append (a) mode")
     parser.add_argument("--coarsen", metavar="mean|max|median", type=str, required=False, default="mean",
                         choices=["mean", "max", "median"],
                         help="Coarsening method for LOD levels, applied to the original data (so 'mean' is an "
@@ -103,16 +104,61 @@ def load_datasets(args, input_config):
                 ds = xr.open_mfdataset(filepath, chunks='auto', engine=var_options.get("engine", None), concat_dim=var_options.get("concat_dim", None), combine='nested' )
             else:
                 ds = xr.open_dataset(filepath, chunks='auto', engine=var_options.get("engine", None))
-            if args.timestamps > 0:
-                ds = ds.isel(time=slice(0, args.timestamps))
-            datasets[target_variable] = rename_dimensions(ds, input_config.get("dimensions", {}))
+            renamed = rename_dimensions(ds, input_config.get("dimensions", {}))
+            renamed.set_close(ds.close)  # renaming drops the link to the open file
+            datasets[target_variable] = renamed
         except FileNotFoundError:
             logging.warning(f'Input file {filepath} not found for variable {target_variable}... skipping')
     return datasets
 
 
-def write_int8_dataset(datasets, input_config, outfile, mode, horizontal_chunks):
+def open_stored(outfile, variable):
+    """Return the existing zarr store at `outfile` if it contains `variable`, otherwise None."""
+    if not os.path.exists(outfile):
+        return None
+    stored = xr.open_zarr(outfile)
+    if variable not in stored:
+        stored.close()
+        return None
+    return stored
+
+
+def new_time_indices(da_or_ds, stored, variable, limit=0):
+    """Return the indices of the time stamps of `da_or_ds` that are not yet written for `variable`.
+
+    Args:
+        stored (xarray.Dataset, optional): The existing store; if None, no time stamp is considered written.
+        limit (int, optional): Maximum number of indices to return (the earliest ones); 0 means no limit.
+
+    Returns:
+        numpy.ndarray: The indices, or None if `da_or_ds` has no time dimension.
+    """
+    if "time" not in da_or_ds.dims:
+        return None
+    times = da_or_ds["time"].values
+    if stored is not None and "time" in stored[variable].dims:
+        indices = np.flatnonzero(~np.isin(times, stored["time"].values))
+    else:
+        indices = np.arange(len(times))
+    return indices[:limit] if limit > 0 else indices
+
+
+def write_variable(int8_var, outfile, variable, mode, stored=None):
+    """Write the int8 dataset of `variable` to zarr; if it is already stored, append the new time stamps."""
+    if stored is not None and "time" in int8_var[variable].dims:
+        int8_var.to_zarr(outfile, mode="a", append_dim="time")
+    else:
+        int8_var.to_zarr(outfile, mode=mode, encoding={variable: VAR_ENCODING})
+
+
+def write_int8_dataset(datasets, input_config, outfile, mode, horizontal_chunks, timestamps=0):
     """Cast each variable to int8 and write it to `outfile` (zarr).
+
+    `mode` is "o" (overwrite: the store is recreated) or "a" (append). In append mode, time stamps that are
+    already present in `outfile` for a variable are skipped, and new time stamps are appended. Variables
+    without new time stamps are skipped altogether. At most `timestamps` (if
+    positive) time stamps are written per variable. The data range and z layer range are always computed over
+    the full time range of the input, regardless of which time stamps are written.
 
     Returns:
         tuple: (written variable names, horizontal chunk sizes, per-variable (data_min, data_max) used for
@@ -125,7 +171,7 @@ def write_int8_dataset(datasets, input_config, outfile, mode, horizontal_chunks)
     z_ranges = {}
     filled_data = {}
     xy_chunks = {}  # horizontal chunk sizes, fixed by the first variable and shared by all variables and levels
-    write_mode = mode
+    write_mode = "w" if mode == "o" else "a"  # zarr write mode; only the first variable may recreate the store
     for target_variable, var_options in input_config.get("variables", {}).items():
         ds = datasets.get(target_variable)
         if ds is None:
@@ -136,10 +182,19 @@ def write_int8_dataset(datasets, input_config, outfile, mode, horizontal_chunks)
         if source_variable not in ds:
             logging.warning(f'Variable {source_variable} not found in the input dataset... skipping')
             continue
+        stored = open_stored(outfile, target_variable) if write_mode == "a" else None
+        time_indices = new_time_indices(ds, stored, target_variable, timestamps)
+        if time_indices is not None and len(time_indices) == 0:
+            logging.info(f'All time stamps of {target_variable} are already written... skipping')
+            if stored is not None:
+                stored.close()
+            continue
         logging.info(f'Processing variable {source_variable} as {target_variable}')
         data, data_min, data_max = prepare_data(ds, source_variable, target_variable, missing_value,
                                                 var_options.get("data_min"), var_options.get("data_max"))
         z_range = compute_z_range(data, data_min, data_max, cast_option) if "z" in data.dims else None
+        if time_indices is not None:
+            data = data.isel(time=time_indices)
         int8_var = cast_filled_to_int8(data, data_min, data_max, cast_option, z_range=z_range)
         filled_data[target_variable] = data
         z_ranges[target_variable] = z_range
@@ -147,7 +202,9 @@ def write_int8_dataset(datasets, input_config, outfile, mode, horizontal_chunks)
             if dim.startswith(("x", "y")) and dim not in xy_chunks:
                 xy_chunks[dim] = math.ceil(int8_var.sizes[dim] / horizontal_chunks)
         int8_var = int8_var.chunk(output_chunks(int8_var[target_variable], xy_chunks))
-        int8_var.to_zarr(outfile, mode=write_mode, encoding={target_variable: VAR_ENCODING})
+        write_variable(int8_var, outfile, target_variable, write_mode, stored)
+        if stored is not None:
+            stored.close()
         output_variables.append(target_variable)
         data_ranges[target_variable] = (data_min, data_max)
         write_mode = "a"
@@ -192,17 +249,19 @@ def fits_in_memory(da, fraction=None):
 
 
 def write_coarsened_datasets(filled_data, input_config, outfile, output_variables, xy_chunks, data_ranges,
-                             z_ranges, levels, coarsen):
+                             z_ranges, levels, coarsen, mode="a"):
     """Coarsen the input data `levels` times, cast it to int8 and write each level to its own zarr store.
 
     Coarsening is done on the missing-value-filled original data returned by `write_int8_dataset`, so `mean`
     is an arithmetic mean of the data. Every level is cast with the data range and the bottom and top z layers
     of the full-resolution variable, so all levels share the same mapping to int8. Only the horizontal
-    dimensions are coarsened. A coarsened level that is the input of the next level is loaded into memory
+    dimensions are coarsened. In append mode, time stamps already present in a level's store are skipped and
+    the remaining ones are appended. In overwrite mode, the level stores are recreated.
+    A coarsened level that is the input of the next level is loaded into memory
     (cached) if enough memory is available, otherwise it stays lazy and is recomputed when needed.
     """
     # NOTE: coarsening assumes all output variables share the same horizontal grid resolution
-    for var in output_variables:
+    for ivar, var in enumerate(output_variables):
         var_options = input_config["variables"][var]
         data_min, data_max = data_ranges[var]
         z_range = z_ranges[var]
@@ -213,11 +272,22 @@ def write_coarsened_datasets(filled_data, input_config, outfile, output_variable
             da = getattr(coarsen_op, coarsen)()
             if level < levels and fits_in_memory(da):
                 da = da.load()
-            int8_var = cast_filled_to_int8(da, data_min, data_max, var_options.get("mode", "linear"),
+            level_outfile = outfile.replace(".zarr", f"-{level}.zarr")
+            stored = open_stored(level_outfile, var) if mode == "a" else None
+            level_indices = new_time_indices(da, stored, var)
+            level_da = da if level_indices is None else da.isel(time=level_indices)
+            if level_indices is not None and len(level_indices) == 0:
+                logging.info(f'All time stamps of {var} at level {level} are already written... skipping')
+                if stored is not None:
+                    stored.close()
+                continue
+            int8_var = cast_filled_to_int8(level_da, data_min, data_max, var_options.get("mode", "linear"),
                                            z_range=z_range)
             int8_var = int8_var.chunk(output_chunks(int8_var[var], xy_chunks))
-            level_outfile = outfile.replace(".zarr", f"-{level}.zarr")
-            int8_var.to_zarr(level_outfile, mode="a", encoding={var: VAR_ENCODING})
+            # In overwrite mode the first variable recreates the level store, like the main store
+            write_variable(int8_var, level_outfile, var, "w" if mode == "o" and ivar == 0 else "a", stored)
+            if stored is not None:
+                stored.close()
 
 
 def main(arg_list=None):
@@ -243,10 +313,14 @@ def main(arg_list=None):
     default_output_dir = args.input_dir if args.input_dir is not None else "."
     outfile = args.output if args.output is not None else os.path.join(default_output_dir, "output_int8.zarr")
 
-    output_variables, xy_chunks, data_ranges, z_ranges, filled_data = write_int8_dataset(
-        datasets, input_config, outfile, args.mode, args.horizontal_chunks)
-    write_coarsened_datasets(filled_data, input_config, outfile, output_variables, xy_chunks, data_ranges,
-                             z_ranges, args.levels, args.coarsen)
+    try:
+        output_variables, xy_chunks, data_ranges, z_ranges, filled_data = write_int8_dataset(
+            datasets, input_config, outfile, args.mode, args.horizontal_chunks, args.timestamps)
+        write_coarsened_datasets(filled_data, input_config, outfile, output_variables, xy_chunks, data_ranges,
+                                 z_ranges, args.levels, args.coarsen, args.mode)
+    finally:
+        for ds in datasets.values():
+            ds.close()
 
 
 if __name__ == "__main__":
