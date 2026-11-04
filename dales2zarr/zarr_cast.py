@@ -84,23 +84,19 @@ def prepare_data(input_ds, var_name, output_var=None, missing_value=None, data_m
     return data.fillna(glob_min), glob_min, glob_max
 
 
-def cast_to_int8_3d(data, data_min, data_max, mode='linear', epsilon=1e-10):
-    """Convert a 3d array (without missing values) to 8-bit integers, trimming empty z levels.
+def compute_z_range(data, data_min, data_max, mode='linear', epsilon=1e-10):
+    """Determine the indices of the lowest and highest z layers that contain non-zero int8 values.
 
     Args:
-        data (xarray.DataArray): Named input array with dimensions (time,) z, y, x.
+        data (xarray.DataArray): Named input array with dimensions (time,) z, y, x, without missing values.
         data_min (float): Global minimum used for normalization.
         data_max (float): Global maximum used for normalization.
         mode (str, optional): The mode used for normalization. Default is 'linear'.
         epsilon (float, optional): Offset used for the logarithmic mapping.
 
     Returns:
-        xarray.Dataset: A new dataset with the converted variable.
-
-    Raises:
-        ValueError: If `mode` is not `linear` or `log`.
+        tuple (int, int): The bottom and top layer indices (kbot, ktop), or (-1, -1) if all layers are empty.
     """
-    var_name = data.name
     # Compute the maximum values for each horizontal layer
     layer_maxes = data.max(['x', 'y']).values
     log.info('layer maxes computed')
@@ -110,6 +106,29 @@ def cast_to_int8_3d(data, data_min, data_max, mode='linear', epsilon=1e-10):
     nonzero_layers = np.flatnonzero(norms.reshape(-1, norms.shape[-1]).max(axis=0))
     kbot, ktop = (int(nonzero_layers[0]), int(nonzero_layers[-1])) if nonzero_layers.size else (-1, -1)
     log.info(f'computed kbot and ktop: {kbot}, {ktop}')
+    return kbot, ktop
+
+
+def cast_to_int8_3d(data, data_min, data_max, mode='linear', epsilon=1e-10, z_range=None):
+    """Convert a 3d array (without missing values) to 8-bit integers, trimming empty z levels.
+
+    Args:
+        data (xarray.DataArray): Named input array with dimensions (time,) z, y, x.
+        data_min (float): Global minimum used for normalization.
+        data_max (float): Global maximum used for normalization.
+        mode (str, optional): The mode used for normalization. Default is 'linear'.
+        epsilon (float, optional): Offset used for the logarithmic mapping.
+        z_range (tuple (int, int), optional): Bottom and top layer indices (kbot, ktop) to keep. Computed
+                                              from the data with `compute_z_range` if not given.
+
+    Returns:
+        xarray.Dataset: A new dataset with the converted variable.
+
+    Raises:
+        ValueError: If `mode` is not `linear` or `log`.
+    """
+    var_name = data.name
+    kbot, ktop = compute_z_range(data, data_min, data_max, mode, epsilon) if z_range is None else z_range
 
     # Get the heights associated with the bottom and top layers
     zbot, ztop = data.z[kbot].values, data.z[ktop].values
@@ -181,15 +200,24 @@ def cast_to_int8_2d(data, data_min, data_max, mode='linear', epsilon=1e-10):
     return output
 
 
-def cast_filled_to_int8(data, data_min, data_max, mode='linear', epsilon=1e-10):
+def cast_filled_to_int8(data, data_min, data_max, mode='linear', epsilon=1e-10, z_range=None):
     """Cast a prepared array (see `prepare_data`) to 8-bit integers, dispatching on its dimensionality.
+
+    Args:
+        z_range (tuple (int, int), optional): Bottom and top layer indices (kbot, ktop) to keep for 3d data,
+                                              see `compute_z_range`. Computed from the data if not given.
 
     Returns:
         xarray.Dataset: A dataset with the casted variable; the z dimension is renamed to `z_<name>`.
     """
     if "z" not in data.dims:
         return cast_to_int8_2d(data, data_min, data_max, mode, epsilon)
-    return cast_to_int8_3d(data, data_min, data_max, mode, epsilon).rename_dims({"z": "z_" + data.name})
+    out = cast_to_int8_3d(data, data_min, data_max, mode, epsilon, z_range)
+    # Trimmed z ranges differ per variable, so the z dimension and the height coordinates along it
+    # must be renamed per variable
+    z_name = "z_" + data.name
+    renames = {c: f"{c}_{data.name}" for c in out.coords if out[c].dims == ("z",)}
+    return out.rename_dims({"z": z_name}).rename_vars(renames)
 
 
 def cast_to_int8(input_ds, input_var, output_var=None, mode='linear', epsilon=1e-10, missing_value=None,

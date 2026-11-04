@@ -8,7 +8,7 @@ import xarray as xr
 import zarr
 import yaml
 import numpy as np
-from dales2zarr.zarr_cast import cast_filled_to_int8, prepare_data
+from dales2zarr.zarr_cast import cast_filled_to_int8, compute_z_range, prepare_data
 
 DALES_INPUT_CONFIG = {
     "variables": {
@@ -16,7 +16,7 @@ DALES_INPUT_CONFIG = {
         "qr":       {"mode": "linear", "file": "fielddump-qr.nc", "variable": "sv002"},
         "thetavmix":{"mode": "linear", "file": "cape-thetavmix.nc", "variable": "thetavmix"},
     },
-    "dimensions": {"xt": "x", "yt": "y", "zt": "z"}
+    "dimensions": {"x": "xt", "y": "yt", "z": "zt"}
 }
 
 
@@ -73,6 +73,17 @@ def output_chunks(da, xy_chunks):
 VAR_ENCODING = {"dtype": "uint8", "compressor": zarr.Blosc(cname="lz4", clevel=6, shuffle=zarr.Blosc.BITSHUFFLE)}
 
 
+def rename_dimensions(ds, dimensions):
+    """Rename the input dimensions and their coordinates to the standard names x, y and z.
+
+    Args:
+        ds (xarray.Dataset): The input dataset.
+        dimensions (dict): Maps standard dimension names (keys) to the dimension names in the input data (values).
+    """
+    renames = {src: dst for dst, src in dimensions.items() if src != dst and src in ds.dims}
+    return ds.rename(renames)
+
+
 def load_datasets(args, input_config):
     """Open per-variable datasets from their input files; returns a dict keyed by target variable."""
     # Open per-variable datasets from their respective input files
@@ -93,8 +104,7 @@ def load_datasets(args, input_config):
                 ds = xr.open_dataset(filepath, chunks='auto', engine=var_options.get("engine", None))
             if args.timestamps > 0:
                 ds = ds.isel(time=slice(0, args.timestamps))
-            renames = {k: v for k, v in input_config.get("dimensions", {}).items() if k in ds.dims}
-            datasets[target_variable] = ds.rename_dims(renames)
+            datasets[target_variable] = rename_dimensions(ds, input_config.get("dimensions", {}))
         except FileNotFoundError:
             logging.warning(f'Input file {filepath} not found for variable {target_variable}... skipping')
     return datasets
@@ -105,11 +115,13 @@ def write_int8_dataset(datasets, input_config, outfile, mode, horizontal_chunks)
 
     Returns:
         tuple: (written variable names, horizontal chunk sizes, per-variable (data_min, data_max) used for
-        the cast, per-variable missing-value-filled data arrays to be used as base for coarsening)
+        the cast, per-variable (kbot, ktop) z layer range (None for 2d variables), per-variable
+        missing-value-filled data arrays to be used as base for coarsening)
     """
     # Process and write each variable immediately to avoid accumulating all data in memory
     output_variables = []
     data_ranges = {}
+    z_ranges = {}
     filled_data = {}
     xy_chunks = {}  # horizontal chunk sizes, fixed by the first variable and shared by all variables and levels
     write_mode = mode
@@ -123,10 +135,13 @@ def write_int8_dataset(datasets, input_config, outfile, mode, horizontal_chunks)
         if source_variable not in ds:
             logging.warning(f'Variable {source_variable} not found in the input dataset... skipping')
             continue
+        logging.info(f'Processing variable {source_variable} as {target_variable}')
         data, data_min, data_max = prepare_data(ds, source_variable, target_variable, missing_value,
                                                 var_options.get("data_min"), var_options.get("data_max"))
-        int8_var = cast_filled_to_int8(data, data_min, data_max, cast_option)
+        z_range = compute_z_range(data, data_min, data_max, cast_option) if "z" in data.dims else None
+        int8_var = cast_filled_to_int8(data, data_min, data_max, cast_option, z_range=z_range)
         filled_data[target_variable] = data
+        z_ranges[target_variable] = z_range
         for dim in int8_var[target_variable].dims:
             if dim.startswith(("x", "y")) and dim not in xy_chunks:
                 xy_chunks[dim] = math.ceil(int8_var.sizes[dim] / horizontal_chunks)
@@ -135,26 +150,30 @@ def write_int8_dataset(datasets, input_config, outfile, mode, horizontal_chunks)
         output_variables.append(target_variable)
         data_ranges[target_variable] = (data_min, data_max)
         write_mode = "a"
-    return output_variables, xy_chunks, data_ranges, filled_data
+    return output_variables, xy_chunks, data_ranges, z_ranges, filled_data
 
 
 def write_coarsened_datasets(filled_data, input_config, outfile, output_variables, xy_chunks, data_ranges,
-                             levels, coarsen):
+                             z_ranges, levels, coarsen):
     """Coarsen the input data `levels` times, cast it to int8 and write each level to its own zarr store.
 
     Coarsening is done on the missing-value-filled original data returned by `write_int8_dataset`, so `mean`
-    is an arithmetic mean of the data. Every level is cast with the data range of the full-resolution variable,
-    so all levels share the same mapping to int8.
+    is an arithmetic mean of the data. Every level is cast with the data range and the bottom and top z layers
+    of the full-resolution variable, so all levels share the same mapping to int8. Only the horizontal
+    dimensions are coarsened.
     """
     # NOTE: coarsening assumes all output variables share the same horizontal grid resolution
     for var in output_variables:
         var_options = input_config["variables"][var]
         data_min, data_max = data_ranges[var]
+        z_range = z_ranges[var]
         da = filled_data[var]
         for level in range(1, levels + 1):
-            coarsen_op = da.coarsen({dim: 2 for dim in da.dims if dim != "time"}, boundary="trim")
+            logging.info(f'Coarsening variable {var} to level {level}')
+            coarsen_op = da.coarsen({dim: 2 for dim in da.dims if dim.startswith(("x", "y"))}, boundary="trim")
             da = getattr(coarsen_op, coarsen)()
-            int8_var = cast_filled_to_int8(da, data_min, data_max, var_options.get("mode", "linear"))
+            int8_var = cast_filled_to_int8(da, data_min, data_max, var_options.get("mode", "linear"),
+                                           z_range=z_range)
             int8_var = int8_var.chunk(output_chunks(int8_var[var], xy_chunks))
             level_outfile = outfile.replace(".zarr", f"-{level}.zarr")
             int8_var.to_zarr(level_outfile, mode="a", encoding={var: VAR_ENCODING})
@@ -183,10 +202,10 @@ def main(arg_list=None):
     default_output_dir = args.input_dir if args.input_dir is not None else "."
     outfile = args.output if args.output is not None else os.path.join(default_output_dir, "output_int8.zarr")
 
-    output_variables, xy_chunks, data_ranges, filled_data = write_int8_dataset(datasets, input_config, outfile, args.mode,
-                                                                  args.horizontal_chunks)
+    output_variables, xy_chunks, data_ranges, z_ranges, filled_data = write_int8_dataset(
+        datasets, input_config, outfile, args.mode, args.horizontal_chunks)
     write_coarsened_datasets(filled_data, input_config, outfile, output_variables, xy_chunks, data_ranges,
-                             args.levels, args.coarsen)
+                             z_ranges, args.levels, args.coarsen)
 
 
 if __name__ == "__main__":

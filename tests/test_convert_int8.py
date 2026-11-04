@@ -63,7 +63,7 @@ def test_main_with_custom_config():
 
         input_config = {"variables": {"ql": {"mode": "log", "file": "fielddump-ql.nc", "variable": "ql"},
                                  "qr": {"mode": "linear", "file": "fielddump-qr.nc", "variable": "qr"}},
-                        "dimensions": {"xt": "x", "yt": "y", "zt": "z"}}
+                        "dimensions": {"x": "xt", "y": "yt", "z": "zt"}}
 
         with open(config_file, "w") as f:
             yaml.safe_dump(input_config, f)
@@ -84,12 +84,37 @@ def test_main_with_custom_config():
         assert output_data["qr"].values.flat[:3].tolist() == [0, 36, 72]
 
 
+def test_main_renames_dimensions_and_coordinates():
+    """Input dimensions and coordinates are renamed to x, y and z_<variable>, also in the coarsened levels."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        output_file = os.path.join(temp_dir, "output.zarr")
+        config_file = os.path.join(temp_dir, "config.yaml")
+
+        data = np.arange(64, dtype=float).reshape(4, 4, 4)
+        xr.Dataset({"ql": (["zu_3d", "ya", "xa"], data)},
+                   coords={"zu_3d": np.arange(4) * 10.0, "ya": np.arange(4) * 1.0, "xa": np.arange(4) * 2.0}
+                   ).to_netcdf(os.path.join(temp_dir, "fielddump-ql.nc"))
+
+        input_config = {"variables": {"ql": {"mode": "linear", "file": "fielddump-ql.nc", "variable": "ql"}},
+                        "dimensions": {"x": "xa", "y": "ya", "z": "zu_3d"}}
+        with open(config_file, "w") as f:
+            yaml.safe_dump(input_config, f)
+
+        main(["--input-dir", temp_dir, "--output", output_file, "--config", config_file, "--levels", "1"])
+
+        for store in (output_file, os.path.join(temp_dir, "output-1.zarr")):
+            ds = xr.open_zarr(store)
+            assert ds["ql"].dims == ("z_ql", "y", "x")
+            assert {"x", "y", "z_ql"} <= set(ds.coords)
+            assert not {"xa", "ya", "zu_3d", "z"} & (set(ds.coords) | set(ds.dims))
+
+
 def test_main_coarsen_max():
     with tempfile.TemporaryDirectory() as temp_dir:
         output_file = os.path.join(temp_dir, "output.zarr")
         lod1_file = os.path.join(temp_dir, "output-1.zarr")
 
-        # 4x4x4 so coarsening by 2 yields a 2x2x2 level
+        # 4x4x4 so coarsening by 2 yields a 4x2x2 level (no vertical coarsening)
         data = np.arange(64, dtype=float).reshape(4, 4, 4)
         ql_ds = xr.Dataset({"ql": (["zt", "yt", "xt"], data)})
         ql_ds.to_netcdf(os.path.join(temp_dir, "fielddump-ql.nc"))
@@ -103,6 +128,10 @@ def test_main_coarsen_max():
         # max-pooling must produce values >= the mean-pooling equivalent
         mean_ds = xr.open_zarr(output_file)
         assert int(lod1["ql"].values.max()) >= int(mean_ds["ql"].values.max())
+        assert lod1["ql"].shape == (4, 2, 2)
+        # the z layers are not coarsened and the layer range of the full-resolution data is reused
+        assert lod1.attrs["zbot"] == mean_ds.attrs["zbot"]
+        assert lod1.attrs["ztop"] == mean_ds.attrs["ztop"]
 
 
 def test_main_custom_filename_in_config():
@@ -115,7 +144,7 @@ def test_main_custom_filename_in_config():
         xr.Dataset({'ql': (['zt', 'yt', 'xt'], input_data)}).to_netcdf(
             os.path.join(temp_dir, "custom-ql.nc"))
 
-        input_config = {"variables": {"ql": {"mode": "log", "file": "custom-ql.nc", "variable": "ql"}}, "dimensions": {"xt": "x", "yt": "y", "zt": "z"}}
+        input_config = {"variables": {"ql": {"mode": "log", "file": "custom-ql.nc", "variable": "ql"}}, "dimensions": {"x": "xt", "y": "yt", "z": "zt"}}
         with open(config_file, "w") as f:
             yaml.safe_dump(input_config, f)
 
@@ -136,7 +165,7 @@ def test_main_with_thetavmix():
         xr.Dataset({'thetavmix': (['yt', 'xt'], input_data)}).to_netcdf(
             os.path.join(temp_dir, "cape-thetavmix.nc"))
 
-        input_config = {"variables": {"thetavmix": {"mode": "linear", "file": "cape-thetavmix.nc", "variable": "thetavmix"}}, "dimensions": {"xt": "x", "yt": "y", "zt": "z"}}
+        input_config = {"variables": {"thetavmix": {"mode": "linear", "file": "cape-thetavmix.nc", "variable": "thetavmix"}}, "dimensions": {"x": "xt", "y": "yt", "z": "zt"}}
         with open(config_file, "w") as f:
             yaml.safe_dump(input_config, f)
 
@@ -158,7 +187,7 @@ def test_main_data_min_used_for_missing_values():
 
         input_config = {"variables": {"ql": {"mode": "linear", "file": "fielddump-ql.nc", "variable": "ql",
                                              "missing_value": "-999.", "data_min": 0.0, "data_max": 8.0}},
-                        "dimensions": {"xt": "x", "yt": "y", "zt": "z"}}
+                        "dimensions": {"x": "xt", "y": "yt", "z": "zt"}}
         with open(config_file, "w") as f:
             yaml.safe_dump(input_config, f)
 
@@ -171,4 +200,5 @@ def test_main_data_min_used_for_missing_values():
 
         # The coarsened level is the mean of the filled data (the missing value counting as 0)
         coarse = xr.open_zarr(os.path.join(temp_dir, "output-1.zarr"))["ql"].values
-        assert coarse.flat[0] == int(np.mean([0, 2, 3, 4, 5, 6, 7, 8]) / 8.0 * 255)
+        assert coarse.shape[-3:] == (2, 1, 1)
+        assert coarse.flat[0] == int(np.mean([0, 2, 3, 4]) / 8.0 * 255)
